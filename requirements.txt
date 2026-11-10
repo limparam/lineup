@@ -1,0 +1,5 @@
+# Зависимости LineUP.
+# tzdata нужен для zoneinfo на Windows и в минимальных Linux-образах.
+# gunicorn нужен только на сервере (Linux); локально используется manage.py serve.
+tzdata>=2024.1
+gunicorn>=22,<25

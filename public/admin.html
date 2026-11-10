@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Админка — LineUP</title>
+  <meta name="theme-color" content="#06070a">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css?v=7">
+</head>
+<body>
+  <header class="adminbar">
+    <a class="brand" href="/" aria-label="LineUP — на главную">
+      Line<span>UP</span><i class="brand__dot" aria-hidden="true"></i>
+    </a>
+    <span class="adminbar__spacer"></span>
+    <span class="adminbar__user" id="who"></span>
+    <button class="btn btn--ghost btn--sm" id="performers-btn" type="button" hidden>Артисты</button>
+    <button class="btn btn--ghost btn--sm" id="audit-btn" type="button" hidden>Журнал</button>
+    <button class="btn btn--ghost btn--sm" id="users-btn" type="button" hidden>Админы</button>
+    <button class="btn btn--ghost btn--sm" id="account-btn" type="button" hidden>Пароль</button>
+    <button class="btn btn--ghost btn--sm" id="logout-btn" type="button" hidden>Выйти</button>
+  </header>
+
+  <main class="wrap wrap--admin">
+    <!-- Вход ------------------------------------------------------------ -->
+    <section id="view-login" hidden>
+      <div class="auth">
+        <h1 class="auth__title">Вход в админку</h1>
+        <p class="auth__sub">Управление мероприятиями, залами и расписанием.</p>
+
+        <form id="login-form" class="stack" novalidate>
+          <div class="field">
+            <label for="login-user">Логин</label>
+            <input id="login-user" name="username" type="text" autocomplete="username"
+                   autocapitalize="none" spellcheck="false" required>
+          </div>
+          <div class="field">
+            <label for="login-pass">Пароль</label>
+            <input id="login-pass" name="password" type="password"
+                   autocomplete="current-password" required>
+          </div>
+          <p class="form-error" id="login-error" role="alert" hidden></p>
+          <button class="btn btn--primary" id="login-submit" type="submit">Войти</button>
+        </form>
+
+        <p class="hint" id="setup-hint" hidden>
+          Администратора ещё нет. Создайте его на сервере командой
+          <code>python manage.py createadmin</code>, затем войдите.
+        </p>
+        <a class="auth__back" href="/">← Вернуться на сайт</a>
+      </div>
+    </section>
+
+    <!-- Список мероприятий ---------------------------------------------- -->
+    <section id="view-events" hidden>
+      <div class="admin-head">
+        <div>
+          <h1 class="admin-title">Мероприятия</h1>
+          <p class="admin-sub">Создавайте события, добавляйте залы и расписание сетов.</p>
+        </div>
+        <button class="btn btn--primary" id="new-event" type="button">+ Новое мероприятие</button>
+      </div>
+      <div class="admin-events" id="admin-events"></div>
+    </section>
+
+    <!-- Редактор мероприятия --------------------------------------------- -->
+    <section id="view-event" hidden>
+      <div class="admin-head">
+        <div>
+          <button class="btn btn--ghost btn--sm" id="back-btn" type="button">← К списку</button>
+          <h1 class="admin-title" id="event-title">Мероприятие</h1>
+          <p class="admin-sub" id="event-sub"></p>
+        </div>
+        <a class="btn btn--ghost btn--sm" id="open-public" href="/" target="_blank" rel="noopener">
+          Открыть на сайте ↗
+        </a>
+      </div>
+
+      <div class="admin-grid">
+        <div class="panel">
+          <div class="panel__head">
+            <h2 class="panel__title">Данные мероприятия</h2>
+          </div>
+
+          <form id="event-form" class="stack" novalidate>
+            <div class="field">
+              <label for="f-title">Название</label>
+              <input id="f-title" type="text" maxlength="120" required placeholder="DNB NIGHT">
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="f-city">Город</label>
+                <input id="f-city" type="text" maxlength="80" placeholder="Москва">
+              </div>
+              <div class="field">
+                <label for="f-venue">Место проведения</label>
+                <input id="f-venue" type="text" maxlength="120" required placeholder="бар Звезда">
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="f-address">Адрес <span class="muted">(необязательно)</span></label>
+              <input id="f-address" type="text" maxlength="200" placeholder="ул. Тверская, 12">
+            </div>
+
+            <div class="field">
+              <label for="f-timezone">Часовой пояс</label>
+              <select id="f-timezone" required></select>
+              <span class="field__hint">Время начала/конца и сетов вводится в этом поясе.</span>
+            </div>
+
+            <div class="field">
+              <label for="f-starts">Начало</label>
+              <input id="f-starts" type="datetime-local" step="60" required>
+            </div>
+
+            <div class="field">
+              <label for="f-ends">Конец</label>
+              <input id="f-ends" type="datetime-local" step="60" required>
+            </div>
+
+            <div class="field">
+              <label for="f-description">Описание <span class="muted">(необязательно)</span></label>
+              <textarea id="f-description" maxlength="2000"
+                        placeholder="Коротко о мероприятии"></textarea>
+            </div>
+
+            <div class="field">
+              <span class="label">Ссылки <span class="muted">(необязательно)</span></span>
+              <div class="links-editor" id="links-list"></div>
+              <button class="btn btn--sm" id="add-link" type="button">+ Добавить ссылку</button>
+              <span class="field__hint">
+                Название и адрес — например, билеты или сообщество. Только http:// и https://.
+              </span>
+            </div>
+
+            <label class="check">
+              <input id="f-published" type="checkbox">
+              <span>Опубликовано на сайте</span>
+            </label>
+
+            <label class="check">
+              <input id="f-lineup-visible" type="checkbox">
+              <span>Показывать лайнап на сайте</span>
+            </label>
+
+            <div class="field">
+              <label for="f-lineup-publish">Открыть лайнап автоматически <span class="muted">(необязательно)</span></label>
+              <input id="f-lineup-publish" type="datetime-local" step="60">
+              <span class="field__hint">
+                Пока дата не наступила, зрители видят только анонс без залов и артистов.
+                Галочка «Показывать лайнап» должна быть включена. Снимите её, чтобы
+                скрыть расписание полностью.
+              </span>
+            </div>
+
+            <div class="form-actions">
+              <button class="btn btn--primary" id="save-event" type="submit">Сохранить</button>
+              <span class="spacer"></span>
+              <button class="btn btn--danger" id="delete-event" type="button" hidden>Удалить</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel">
+          <div class="panel__head">
+            <h2 class="panel__title">Залы и расписание</h2>
+            <span class="muted small" id="halls-count"></span>
+          </div>
+
+          <div id="halls"></div>
+
+          <form class="add-hall" id="add-hall-form" novalidate>
+            <input type="text" id="hall-name-input" maxlength="60"
+                   placeholder="Название зала, например «Зал 2»" required>
+            <button class="btn" type="submit">+ Добавить зал</button>
+          </form>
+
+          <p class="field__hint mt-md">
+            У каждого сета обязательны начало и конец. Пересечения по времени
+            внутри одного зала не допускаются.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Администраторы (только супер) ------------------------------------ -->
+    <section id="view-users" hidden>
+      <div class="admin-head">
+        <div>
+          <button class="btn btn--ghost btn--sm" id="users-back" type="button">← К мероприятиям</button>
+          <h1 class="admin-title">Администраторы</h1>
+          <p class="admin-sub">
+            Главный администратор может добавлять, удалять и менять пароли остальным.
+          </p>
+        </div>
+      </div>
+
+      <div class="admin-grid">
+        <div class="panel">
+          <div class="panel__head">
+            <h2 class="panel__title">Новый администратор</h2>
+          </div>
+          <form id="add-user-form" class="stack" novalidate>
+            <div class="field">
+              <label for="u-username">Логин</label>
+              <input id="u-username" type="text" maxlength="80" autocomplete="off"
+                     autocapitalize="none" spellcheck="false" required>
+            </div>
+            <div class="field">
+              <label for="u-password">Пароль</label>
+              <input id="u-password" type="password" autocomplete="new-password"
+                     minlength="10" required>
+              <span class="field__hint">Не короче 10 символов.</span>
+            </div>
+            <p class="form-error" id="add-user-error" role="alert" hidden></p>
+            <div class="form-actions">
+              <button class="btn btn--primary" id="add-user-submit" type="submit">Добавить</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel">
+          <div class="panel__head">
+            <h2 class="panel__title">Список администраторов</h2>
+            <span class="muted small" id="users-count"></span>
+          </div>
+          <div class="users-list" id="users-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Журнал действий (только супер) ----------------------------------- -->
+    <section id="view-audit" hidden>
+      <div class="admin-head">
+        <div>
+          <button class="btn btn--ghost btn--sm" id="audit-back" type="button">← К мероприятиям</button>
+          <h1 class="admin-title">Журнал действий</h1>
+          <p class="admin-sub">
+            Кто создавал, менял и удалял мероприятия, залы, артистов и администраторов.
+          </p>
+        </div>
+        <div class="admin-head__side">
+          <span class="muted small" id="audit-count"></span>
+          <button class="btn btn--danger btn--sm" id="audit-clear" type="button">
+            Очистить журнал
+          </button>
+        </div>
+      </div>
+      <div class="audit-list" id="audit-list"></div>
+    </section>
+
+    <!-- Артисты для автозаполнения (только супер) ------------------------ -->
+    <section id="view-performers" hidden>
+      <div class="admin-head">
+        <div>
+          <button class="btn btn--ghost btn--sm" id="performers-back" type="button">← К мероприятиям</button>
+          <h1 class="admin-title">Артисты</h1>
+          <p class="admin-sub">
+            Имена для автозаполнения. Удаление убирает подсказку и публичный
+            поиск, но не меняет уже добавленные выступления.
+          </p>
+        </div>
+        <span class="muted small" id="performers-count"></span>
+      </div>
+
+      <div class="panel">
+        <div class="performers-toolbar">
+          <input
+            id="performers-search"
+            type="search"
+            placeholder="Найти артиста по имени"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck="false"
+            aria-label="Поиск артиста в списке"
+          >
+        </div>
+        <div class="users-list" id="performers-admin"></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="account-dialog">
+    <h2>Сменить пароль</h2>
+    <p class="auth__sub">Не короче 10 символов. Остальные сессии будут завершены.</p>
+    <form id="password-form" class="stack" novalidate>
+      <div class="field">
+        <label for="p-current">Текущий пароль</label>
+        <input id="p-current" type="password" autocomplete="current-password" required>
+      </div>
+      <div class="field">
+        <label for="p-new">Новый пароль</label>
+        <input id="p-new" type="password" autocomplete="new-password" minlength="10" required>
+      </div>
+      <div class="field">
+        <label for="p-confirm">Повторите новый пароль</label>
+        <input id="p-confirm" type="password" autocomplete="new-password" required>
+      </div>
+      <p class="form-error" id="password-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="btn btn--ghost" id="cancel-password" type="button">Отмена</button>
+        <button class="btn btn--primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="user-dialog">
+    <h2>Сменить пароль</h2>
+    <p class="auth__sub" id="user-dialog-sub"></p>
+    <form id="user-password-form" class="stack" novalidate>
+      <div class="field">
+        <label for="up-password">Новый пароль</label>
+        <input id="up-password" type="password" autocomplete="new-password"
+               minlength="10" required>
+      </div>
+      <div class="field">
+        <label for="up-confirm">Повторите пароль</label>
+        <input id="up-confirm" type="password" autocomplete="new-password" required>
+      </div>
+      <p class="form-error" id="user-password-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="btn btn--ghost" id="cancel-user-password" type="button">Отмена</button>
+        <button class="btn btn--primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <datalist id="performers-list"></datalist>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <script type="module" src="/assets/admin.js?v=7"></script>
+</body>
+</html>

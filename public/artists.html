@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Артисты и диджеи — LineUP</title>
+  <meta name="description" content="Артисты и диджеи LineUP: кто играет на ближайших мероприятиях. Поиск по имени даже без актуальных выступлений.">
+  <meta name="theme-color" content="#06070a">
+  <meta property="og:title" content="Артисты и диджеи — LineUP">
+  <meta property="og:description" content="Кто играет на ближайших мероприятиях и где именно.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css?v=7">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="LineUP — на главную">
+      Line<span>UP</span><i class="brand__dot" aria-hidden="true"></i>
+    </a>
+    <nav class="topbar__nav" aria-label="Навигация">
+      <a class="topbar__link" href="/#afisha">Афиша</a>
+      <a class="topbar__link topbar__link--active" href="/artists" aria-current="page">Артисты</a>
+    </nav>
+  </header>
+
+  <main class="wrap">
+    <section class="section section--artists">
+      <div class="artists-head">
+        <div>
+          <h1 class="artists-title">Артисты и диджеи</h1>
+          <p class="artists-sub">
+            Кто играет на актуальных мероприятиях и в каких залах.
+            Артиста без ближайших выступлений тоже можно найти через поиск.
+          </p>
+        </div>
+        <span class="muted small" id="artists-count"></span>
+      </div>
+
+      <label class="artist-search">
+        <svg
+          class="artist-search__icon"
+          viewBox="0 0 24 24"
+          width="18"
+          height="18"
+          aria-hidden="true"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+        >
+          <circle cx="11" cy="11" r="6"></circle>
+          <path d="M16 16l4 4"></path>
+        </svg>
+        <input
+          id="artist-search"
+          type="search"
+          placeholder="Найти артиста или диджея"
+          autocomplete="off"
+          autocapitalize="none"
+          spellcheck="false"
+          aria-label="Поиск артиста или диджея"
+        >
+      </label>
+
+      <div class="artists-list" id="artists">
+        <div class="skeleton" aria-label="Загрузка артистов"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>© <span id="year">2026</span> LineUP — расписание мероприятий</span>
+    <a href="/admin">Вход для организаторов</a>
+  </footer>
+
+  <script type="module" src="/assets/artists.js?v=7"></script>
+</body>
+</html>

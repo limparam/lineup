@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>LineUP — афиша мероприятий</title>
+  <meta name="description" content="LineUP — расписание мероприятий, залов и диджеев. Смотрите, кто играет прямо сейчас.">
+  <meta name="theme-color" content="#06070a">
+  <meta property="og:title" content="LineUP — афиша мероприятий">
+  <meta property="og:description" content="Расписание залов и диджеев. Кто играет прямо сейчас — видно сразу.">
+  <meta property="og:type" content="website">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css?v=7">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="LineUP — на главную">
+      Line<span>UP</span><i class="brand__dot" aria-hidden="true"></i>
+    </a>
+    <nav class="topbar__nav" aria-label="Навигация">
+      <a class="topbar__link" href="/#afisha">Афиша</a>
+      <a class="topbar__link" href="/artists">Артисты</a>
+    </nav>
+  </header>
+
+  <main class="wrap">
+    <div id="featured">
+      <div class="skeleton" aria-label="Загрузка афиши"></div>
+    </div>
+
+    <section class="section" id="afisha" hidden>
+      <div class="section__head">
+        <h2>Афиша</h2>
+        <span class="muted small" id="events-count"></span>
+      </div>
+      <div class="event-list" id="events"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>© <span id="year">2026</span> LineUP — расписание мероприятий</span>
+    <a href="/admin">Вход для организаторов</a>
+  </footer>
+
+  <script type="module" src="/assets/home.js?v=7"></script>
+</body>
+</html>

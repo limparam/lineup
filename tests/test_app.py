@@ -1,0 +1,1062 @@
+"""Интеграционные тесты LineUP (stdlib unittest, без внешних зависимостей)."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from datetime import timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+_tmp = tempfile.TemporaryDirectory()
+os.environ["LINEUP_DB"] = str(Path(_tmp.name) / "test.db")
+os.environ["LINEUP_AUTO_INIT"] = "1"
+os.environ["LINEUP_COOKIE_SECURE"] = "auto"
+os.environ["LINEUP_TRUST_PROXY"] = "0"
+os.environ["LINEUP_LOGIN_MAX_FAILURES"] = "3"
+os.environ["LINEUP_LOGIN_MAX_USER_FAILURES"] = "100"
+os.environ["LINEUP_LOGIN_WINDOW"] = "900"
+
+import app as appmod  # noqa: E402
+import db  # noqa: E402
+import security  # noqa: E402
+import timeutil  # noqa: E402
+
+PASSWORD = "correct-horse-battery"
+
+
+class Client:
+    """Мини-клиент поверх WSGI-приложения."""
+
+    def __init__(self, testcase):
+        self.testcase = testcase
+        self.cookies = {}
+        self.csrf = None
+
+    def request(self, method, path, body=None, *, csrf=None,
+                scheme="http", ip="127.0.0.1"):
+        if "?" in path:
+            path, query = path.split("?", 1)
+        else:
+            query = ""
+        payload = b"" if body is None else json.dumps(body).encode("utf-8")
+        environ = {
+            "REQUEST_METHOD": method,
+            "PATH_INFO": path,
+            "QUERY_STRING": query,
+            "SERVER_NAME": "testserver",
+            "SERVER_PORT": "80",
+            "SERVER_PROTOCOL": "HTTP/1.1",
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": scheme,
+            "wsgi.input": io.BytesIO(payload),
+            "wsgi.errors": io.StringIO(),
+            "REMOTE_ADDR": ip,
+            "HTTP_HOST": "testserver",
+            "CONTENT_LENGTH": str(len(payload)),
+            "CONTENT_TYPE": "application/json",
+        }
+        if self.cookies:
+            environ["HTTP_COOKIE"] = "; ".join(
+                f"{name}={value}" for name, value in self.cookies.items()
+            )
+        if csrf:
+            environ["HTTP_X_CSRF_TOKEN"] = csrf
+
+        captured = {}
+
+        def start_response(status, headers, exc_info=None):
+            captured["status"] = status
+            captured["headers"] = headers
+
+        chunks = appmod.app(environ, start_response)
+        raw = b"".join(chunks)
+        headers = {name.lower(): value for name, value in captured["headers"]}
+
+        cookie = headers.get("set-cookie")
+        if cookie:
+            pair = cookie.split(";", 1)[0]
+            if "=" in pair:
+                name, value = pair.split("=", 1)
+                if value:
+                    self.cookies[name] = value
+                else:
+                    self.cookies.pop(name, None)
+
+        data = None
+        if raw and "json" in headers.get("content-type", ""):
+            data = json.loads(raw.decode("utf-8"))
+        return int(captured["status"].split()[0]), headers, data
+
+    def get(self, path, **kwargs):
+        return self.request("GET", path, **kwargs)
+
+    def post(self, path, body=None, **kwargs):
+        return self.request("POST", path, body, **kwargs)
+
+    def patch(self, path, body=None, **kwargs):
+        return self.request("PATCH", path, body, **kwargs)
+
+    def delete(self, path, **kwargs):
+        return self.request("DELETE", path, **kwargs)
+
+
+class LineUPTestCase(unittest.TestCase):
+    def setUp(self):
+        db.init()
+        conn = db.connect()
+        for table in ("audit_log", "performers", "performances", "halls",
+                      "event_links", "events", "sessions", "login_attempts", "users"):
+            conn.execute(f"DELETE FROM {table}")
+        cursor = conn.execute(
+            "INSERT INTO users (username, password_hash, is_super, created_at) "
+            "VALUES (?, ?, 1, ?)",
+            ("admin", security.hash_password(PASSWORD), timeutil.iso_now()),
+        )
+        self.super_id = int(cursor.lastrowid)
+        conn.commit()
+        conn.close()
+        self.client = Client(self)
+
+    # -- helpers ---------------------------------------------------------
+
+    def login(self, password=PASSWORD, scheme="http"):
+        status, headers, data = self.client.post(
+            "/api/admin/login", {"username": "admin", "password": password},
+            scheme=scheme,
+        )
+        self.assertEqual(status, 200, data)
+        self.client.csrf = data["csrfToken"]
+        return headers
+
+    def create_event_as(self, client, **overrides):
+        payload = {
+            "title": "DNB NIGHT",
+            "city": "Москва",
+            "venue": "бар Звезда",
+            "address": "ул. Тверская, 12",
+            "description": "Ночь драм-н-бейса",
+            "timezone": "Europe/Moscow",
+            "startsAt": "2027-11-04T20:00",
+            "endsAt": "2027-11-05T06:00",
+            "published": True,
+        }
+        payload.update(overrides)
+        status, _, data = client.post(
+            "/api/admin/events", payload, csrf=client.csrf)
+        self.assertEqual(status, 201, data)
+        return data["event"]
+
+    def create_event(self, **overrides):
+        self.login()
+        return self.create_event_as(self.client, **overrides)
+
+    def add_hall(self, event_id, name="Зал 1"):
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event_id}/halls",
+            {"name": name}, csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        return data["hall"]
+
+    def add_perf(self, hall_id, performer, starts, ends, expect=201):
+        status, _, data = self.client.post(
+            f"/api/admin/halls/{hall_id}/performances",
+            {"performer": performer, "startsAt": starts, "endsAt": ends},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, expect, data)
+        return data
+
+    def create_admin(self, username="helper", password="helper-password-1"):
+        self.login()
+        status, _, data = self.client.post(
+            "/api/admin/users",
+            {"username": username, "password": password},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        return data["user"]
+
+    def login_as(self, username, password):
+        client = Client(self)
+        status, _, data = client.post(
+            "/api/admin/login", {"username": username, "password": password})
+        self.assertEqual(status, 200, data)
+        client.csrf = data["csrfToken"]
+        return client
+
+    # -- public ----------------------------------------------------------
+
+    def test_empty_site(self):
+        status, headers, data = self.client.get("/api/public/featured")
+        self.assertEqual(status, 200)
+        self.assertIsNone(data["event"])
+        self.assertEqual(data["others"], [])
+        self.assertIn("serverNow", data)
+        self.assertIn("content-security-policy", headers)
+        self.assertEqual(headers.get("x-frame-options"), "DENY")
+        self.assertEqual(headers.get("cache-control"), "no-store")
+
+    def test_pages_are_served(self):
+        for path in ("/", "/e/dnb-night", "/admin", "/artists"):
+            status, headers, _ = self.client.get(path)
+            self.assertEqual(status, 200, path)
+            self.assertIn("text/html", headers["content-type"])
+            self.assertIn("frame-ancestors 'none'", headers["content-security-policy"])
+
+    def test_no_csrf_is_rejected(self):
+        self.login()
+        status, _, data = self.client.post(
+            "/api/admin/events",
+            {"title": "X", "venue": "Y", "startsAt": "2027-01-01T20:00",
+             "endsAt": "2027-01-01T23:00"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(data["error"]["code"], "csrf")
+
+    def test_foreign_origin_is_rejected(self):
+        self.login()
+
+        def bad_origin_request():
+            payload = json.dumps({"title": "X", "venue": "Y",
+                                  "startsAt": "2027-01-01T20:00",
+                                  "endsAt": "2027-01-01T23:00"}).encode()
+            environ = {
+                "REQUEST_METHOD": "POST", "PATH_INFO": "/api/admin/events",
+                "QUERY_STRING": "", "SERVER_NAME": "testserver",
+                "SERVER_PORT": "80", "wsgi.url_scheme": "http",
+                "wsgi.input": io.BytesIO(payload), "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_HOST": "testserver", "CONTENT_LENGTH": str(len(payload)),
+                "CONTENT_TYPE": "application/json",
+                "HTTP_COOKIE": "; ".join(f"{k}={v}" for k, v in self.client.cookies.items()),
+                "HTTP_X_CSRF_TOKEN": self.client.csrf,
+                "HTTP_ORIGIN": "https://evil.example",
+            }
+            captured = {}
+            appmod.app(environ, lambda s, h, e=None: captured.update(status=s))
+            return int(captured["status"].split()[0])
+
+        self.assertEqual(bad_origin_request(), 403)
+
+    # -- auth ------------------------------------------------------------
+
+    def test_login_rejects_bad_password(self):
+        status, _, data = self.client.post(
+            "/api/admin/login", {"username": "admin", "password": "wrong"})
+        self.assertEqual(status, 401)
+        self.assertEqual(data["error"]["code"], "invalid_credentials")
+
+    def test_login_cookie_flags(self):
+        headers = self.login()
+        cookie = headers["set-cookie"]
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("Path=/", cookie)
+        self.assertNotIn("Secure", cookie)
+
+        secure_headers = self.login(scheme="https")
+        self.assertIn("Secure", secure_headers["set-cookie"])
+
+    def test_session_endpoint(self):
+        status, _, _ = self.client.get("/api/admin/session")
+        self.assertEqual(status, 401)
+        self.login()
+        status, _, data = self.client.get("/api/admin/session")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["authenticated"])
+        self.assertEqual(data["user"]["username"], "admin")
+        self.assertTrue(data["csrfToken"])
+
+    def test_admin_requires_session(self):
+        status, _, data = self.client.get("/api/admin/events")
+        self.assertEqual(status, 401)
+        self.assertEqual(data["error"]["code"], "unauthorized")
+
+    def test_login_rate_limit(self):
+        for _ in range(3):
+            status, _, _ = self.client.post(
+                "/api/admin/login", {"username": "admin", "password": "nope"})
+            self.assertEqual(status, 401)
+        status, headers, data = self.client.post(
+            "/api/admin/login", {"username": "admin", "password": "nope"})
+        self.assertEqual(status, 429)
+        self.assertIn("retry-after", headers)
+
+    def test_password_change_revokes_other_sessions(self):
+        self.login()
+        other = Client(self)
+        status, _, data = other.post(
+            "/api/admin/login", {"username": "admin", "password": PASSWORD})
+        self.assertEqual(status, 200)
+        other.csrf = data["csrfToken"]
+
+        status, _, data = self.client.post(
+            "/api/admin/password",
+            {"currentPassword": PASSWORD, "newPassword": "brand-new-secret-1"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+
+        status, _, _ = other.get("/api/admin/events")
+        self.assertEqual(status, 401)
+        status, _, _ = self.client.get("/api/admin/events")
+        self.assertEqual(status, 200)
+
+    # -- CRUD ------------------------------------------------------------
+
+    def test_event_create_and_timezone_conversion(self):
+        event = self.create_event()
+        self.assertEqual(event["startsAt"], "2027-11-04T17:00:00Z")
+        self.assertEqual(event["endsAt"], "2027-11-05T03:00:00Z")
+        self.assertEqual(event["startsAtLocal"], "2027-11-04T20:00")
+        self.assertEqual(event["slug"], "dnb-night")
+
+    def test_full_schedule_flow(self):
+        event = self.create_event()
+        hall1 = self.add_hall(event["id"], "Зал 1")
+        hall2 = self.add_hall(event["id"], "Зал 2")
+
+        self.add_perf(hall1["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00")
+        self.add_perf(hall1["id"], "DJ Smash", "2027-11-04T21:00", "2027-11-04T22:00")
+        self.add_perf(hall2["id"], "DJ Rob", "2027-11-04T20:00", "2027-11-04T21:00")
+
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertEqual(status, 200)
+        public_event = data["event"]
+        self.assertEqual(public_event["title"], "DNB NIGHT")
+        self.assertEqual(len(public_event["halls"]), 2)
+        self.assertEqual(public_event["halls"][0]["name"], "Зал 1")
+        self.assertEqual(len(public_event["halls"][0]["performances"]), 2)
+        self.assertEqual(
+            public_event["halls"][0]["performances"][0]["startsAt"],
+            "2027-11-04T17:00:00Z",
+        )
+        self.assertNotIn("startsAtLocal", public_event["halls"][0]["performances"][0])
+
+        status, _, data = self.client.get("/e/dnb-night")
+        self.assertEqual(status, 200)
+
+        status, _, data = self.client.get("/api/public/events/dnb-night")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["event"]["slug"], "dnb-night")
+
+    def test_overlap_is_rejected(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T22:00")
+        status, _, data = self.client.post(
+            f"/api/admin/halls/{hall['id']}/performances",
+            {"performer": "DJ Rob", "startsAt": "2027-11-04T21:00",
+             "endsAt": "2027-11-04T23:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(data["error"]["code"], "overlap")
+        self.assertIn("DJ Vik", data["error"]["message"])
+
+    def test_performance_must_be_inside_event(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        status, _, data = self.client.post(
+            f"/api/admin/halls/{hall['id']}/performances",
+            {"performer": "Too Late", "startsAt": "2027-11-05T05:00",
+             "endsAt": "2027-11-05T07:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("внутри", data["error"]["message"])
+
+    def test_performance_requires_end(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        status, _, data = self.client.post(
+            f"/api/admin/halls/{hall['id']}/performances",
+            {"performer": "No End", "startsAt": "2027-11-04T21:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("окончания", data["error"]["message"])
+
+    def test_event_validation(self):
+        self.login()
+        status, _, data = self.client.post(
+            "/api/admin/events",
+            {"title": "Bad", "venue": "Place", "timezone": "Europe/Moscow",
+             "startsAt": "2027-11-04T20:00", "endsAt": "2027-11-04T19:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("позже", data["error"]["message"])
+
+        status, _, data = self.client.post(
+            "/api/admin/events",
+            {"title": "Bad", "venue": "Place", "timezone": "Mars/Olympus",
+             "startsAt": "2027-11-04T20:00", "endsAt": "2027-11-04T21:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400)
+
+    def test_slug_uniqueness(self):
+        self.create_event()
+        self.login()
+        status, _, data = self.client.post(
+            "/api/admin/events",
+            {"title": "DNB NIGHT", "venue": "Другой бар",
+             "timezone": "Europe/Moscow",
+             "startsAt": "2027-12-04T20:00", "endsAt": "2027-12-05T02:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        self.assertNotEqual(data["event"]["slug"], "dnb-night")
+
+    def test_draft_is_hidden_from_public(self):
+        self.create_event(published=False)
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertIsNone(data["event"])
+        status, _, _ = self.client.get("/api/public/events/dnb-night")
+        self.assertEqual(status, 404)
+
+        status, _, data = self.client.get("/api/admin/events")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["events"]), 1)
+        self.assertFalse(data["events"][0]["published"])
+
+    def test_delete_cascades(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00")
+
+        status, _, data = self.client.delete(
+            f"/api/admin/events/{event['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+
+        conn = db.connect()
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM halls").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM performances").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_admin_event_payload_has_local_times(self):
+        event = self.create_event()
+        status, _, data = self.client.get(f"/api/admin/events/{event['id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["event"]["startsAtLocal"], "2027-11-04T20:00")
+        self.assertIn("timezones", data)
+
+    # -- ссылки мероприятия ---------------------------------------------
+
+    def test_event_links_roundtrip(self):
+        event = self.create_event(links=[
+            {"title": "Билеты", "url": "https://tickets.example/dnb"},
+            {"title": "", "url": "https://t.me/dnb"},
+        ])
+        self.assertEqual(len(event["links"]), 2)
+        self.assertEqual(event["links"][0]["title"], "Билеты")
+
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [link["url"] for link in data["event"]["links"]],
+            ["https://tickets.example/dnb", "https://t.me/dnb"],
+        )
+
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}",
+            {"links": [{"title": "Сайт", "url": "http://example.com"}]},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertEqual([link["title"] for link in data["event"]["links"]], ["Сайт"])
+
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"links": []},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["links"], [])
+
+    def test_event_links_validation(self):
+        self.login()
+        bad_variants = [
+            [{"title": "x", "url": "javascript:alert(1)"}],
+            [{"title": "x", "url": "ftp://example.com"}],
+            [{"title": "x" * 81, "url": "https://example.com"}],
+            [{"title": str(i), "url": f"https://example.com/{i}"} for i in range(13)],
+        ]
+        for links in bad_variants:
+            status, _, data = self.client.post(
+                "/api/admin/events",
+                {"title": "Links", "venue": "Place",
+                 "timezone": "Europe/Moscow",
+                 "startsAt": "2027-11-04T20:00",
+                 "endsAt": "2027-11-05T02:00", "links": links},
+                csrf=self.client.csrf,
+            )
+            self.assertEqual(status, 400, (links, data))
+
+    def test_delete_removes_links(self):
+        event = self.create_event(links=[
+            {"title": "Билеты", "url": "https://example.com"}])
+        status, _, _ = self.client.delete(
+            f"/api/admin/events/{event['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        conn = db.connect()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM event_links").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    # -- срок жизни и артисты -------------------------------------------
+
+    def test_expired_events_hide_after_seven_days(self):
+        now = timeutil.now_utc()
+        tz = "Europe/Moscow"
+
+        def local(dt):
+            return timeutil.to_local_input(dt, tz)
+
+        expired_end = now - timedelta(days=8)
+        expired = self.create_event(
+            title="OLD NIGHT",
+            startsAt=local(expired_end - timedelta(hours=2)),
+            endsAt=local(expired_end),
+        )
+        recent_end = now - timedelta(days=1)
+        recent = self.create_event(
+            title="RECENT NIGHT",
+            startsAt=local(recent_end - timedelta(hours=2)),
+            endsAt=local(recent_end),
+        )
+
+        status, _, data = self.client.get("/api/public/events")
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in data["events"]], [recent["id"]])
+
+        status, _, _ = self.client.get("/api/public/events/old-night")
+        self.assertEqual(status, 404)
+
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertEqual(data["event"]["id"], recent["id"])
+
+        status, _, data = self.client.get("/api/admin/events")
+        flags = {item["id"]: item["publiclyVisible"] for item in data["events"]}
+        self.assertFalse(flags[expired["id"]])
+        self.assertTrue(flags[recent["id"]])
+
+        # Перенос времени в будущее публикует мероприятие снова.
+        future_start = now + timedelta(days=2)
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{expired['id']}",
+            {
+                "startsAt": local(future_start),
+                "endsAt": local(future_start + timedelta(hours=3)),
+            },
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["event"]["publiclyVisible"])
+
+        status, _, data = self.client.get("/api/public/events")
+        self.assertIn(expired["id"], [item["id"] for item in data["events"]])
+
+    def test_public_artists_and_search(self):
+        event = self.create_event(title="ART NIGHT")
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00")
+        self.add_perf(hall["id"], "DJ Smash", "2027-11-04T21:00", "2027-11-04T22:00")
+
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertEqual(status, 200)
+        self.assertEqual([a["name"] for a in data["artists"]], ["DJ Smash", "DJ Vik"])
+        vik = next(a for a in data["artists"] if a["name"] == "DJ Vik")
+        self.assertEqual(vik["eventCount"], 1)
+        self.assertEqual(vik["events"][0]["slug"], "art-night")
+        self.assertEqual(vik["events"][0]["sets"][0]["hall"], "Зал 1")
+
+        status, _, data = self.client.get("/api/public/artists?q=vik")
+        self.assertEqual([a["name"] for a in data["artists"]], ["DJ Vik"])
+
+        # Артист без актуальных мероприятий находится только через поиск.
+        now = timeutil.now_utc()
+        tz = "Europe/Moscow"
+        expired_end = now - timedelta(days=9)
+        old = self.create_event(
+            title="OLD ART",
+            startsAt=timeutil.to_local_input(
+                expired_end - timedelta(hours=3), tz),
+            endsAt=timeutil.to_local_input(expired_end, tz),
+        )
+        old_hall = self.add_hall(old["id"])
+        self.add_perf(
+            old_hall["id"], "Vintage DJ",
+            timeutil.to_local_input(expired_end - timedelta(hours=2), tz),
+            timeutil.to_local_input(expired_end - timedelta(hours=1), tz),
+        )
+
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertNotIn("Vintage DJ", [a["name"] for a in data["artists"]])
+        status, _, data = self.client.get("/api/public/artists?q=vintage")
+        self.assertEqual([a["name"] for a in data["artists"]], ["Vintage DJ"])
+        self.assertEqual(data["artists"][0]["events"], [])
+
+        # Артистов из скрытого лайнапа не раскрываем даже в поиске.
+        hidden = self.create_event(title="SECRET NIGHT", lineupVisible=False)
+        hidden_hall = self.add_hall(hidden["id"])
+        self.add_perf(
+            hidden_hall["id"], "Secret DJ",
+            "2027-11-04T20:00", "2027-11-04T21:00",
+        )
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertNotIn("Secret DJ", [a["name"] for a in data["artists"]])
+        status, _, data = self.client.get("/api/public/artists?q=secret")
+        self.assertEqual(data["artists"], [])
+
+    def test_performer_database_survives_perf_delete(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        created = self.add_perf(
+            hall["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00")
+
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertEqual(status, 200)
+        self.assertIn("DJ Vik", data["performers"])
+
+        status, _, _ = self.client.delete(
+            f"/api/admin/performances/{created['performance']['id']}",
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200)
+
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertIn("DJ Vik", data["performers"])
+
+    def test_performer_hints_are_owner_scoped(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "Super DJ", "2027-11-04T20:00", "2027-11-04T21:00")
+
+        self.create_admin()
+        helper = self.login_as("helper", "helper-password-1")
+        own = self.create_event_as(helper, title="HELPER NIGHT")
+        status, _, data = helper.post(
+            f"/api/admin/events/{own['id']}/halls", {"name": "Зал 1"},
+            csrf=helper.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        status, _, data = helper.post(
+            f"/api/admin/halls/{data['hall']['id']}/performances",
+            {"performer": "Helper DJ",
+             "startsAt": "2027-11-04T20:00", "endsAt": "2027-11-04T21:00"},
+            csrf=helper.csrf,
+        )
+        self.assertEqual(status, 201, data)
+
+        status, _, data = helper.get("/api/admin/performers")
+        self.assertIn("Helper DJ", data["performers"])
+        self.assertNotIn("Super DJ", data["performers"])
+
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertIn("Super DJ", data["performers"])
+        self.assertIn("Helper DJ", data["performers"])
+
+    # -- журнал: очистка -------------------------------------------------
+
+    def test_only_super_can_clear_audit(self):
+        self.create_admin()
+        helper = self.login_as("helper", "helper-password-1")
+        status, _, data = helper.delete("/api/admin/audit", csrf=helper.csrf)
+        self.assertEqual(status, 403, data)
+        self.assertEqual(data["error"]["code"], "forbidden")
+
+    def test_super_clears_audit_without_new_entry(self):
+        self.create_event()
+        self.login()
+        status, _, data = self.client.get("/api/admin/audit")
+        self.assertEqual(status, 200)
+        self.assertGreater(len(data["entries"]), 0)
+
+        status, _, data = self.client.delete(
+            "/api/admin/audit", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertGreater(data["deleted"], 0)
+
+        status, _, data = self.client.get("/api/admin/audit")
+        self.assertEqual(data["entries"], [])
+
+    # -- роли, владение и журнал -----------------------------------------
+
+    def test_regular_admin_sees_only_own_events(self):
+        super_event = self.create_event()
+        self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+        own = self.create_event_as(client, title="HELPER NIGHT")
+
+        status, _, data = client.get("/api/admin/events")
+        self.assertEqual(status, 200, data)
+        self.assertEqual([item["id"] for item in data["events"]], [own["id"]])
+
+        status, _, data = self.client.get("/api/admin/events")
+        self.assertEqual(status, 200, data)
+        self.assertEqual({item["id"] for item in data["events"]},
+                         {super_event["id"], own["id"]})
+        owners = {item["id"]: item["ownerUsername"] for item in data["events"]}
+        self.assertEqual(owners[super_event["id"]], "admin")
+        self.assertEqual(owners[own["id"]], "helper")
+
+        status, _, data = self.client.get(f"/api/admin/events/{own['id']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["ownerUsername"], "helper")
+
+    def test_foreign_event_is_invisible_to_regular_admin(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        perf = self.add_perf(hall["id"], "DJ Vik",
+                             "2027-11-04T20:00", "2027-11-04T21:00")["performance"]
+        self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+
+        attempts = [
+            ("GET", f"/api/admin/events/{event['id']}", None),
+            ("PATCH", f"/api/admin/events/{event['id']}", {"title": "Взлом"}),
+            ("DELETE", f"/api/admin/events/{event['id']}", None),
+            ("POST", f"/api/admin/events/{event['id']}/halls",
+             {"name": "Чужой зал"}),
+            ("PATCH", f"/api/admin/halls/{hall['id']}", {"name": "Чужой зал"}),
+            ("DELETE", f"/api/admin/halls/{hall['id']}", None),
+            ("POST", f"/api/admin/halls/{hall['id']}/performances",
+             {"performer": "Чужой", "startsAt": "2027-11-04T21:00",
+              "endsAt": "2027-11-04T22:00"}),
+            ("PATCH", f"/api/admin/performances/{perf['id']}",
+             {"performer": "Чужой"}),
+            ("DELETE", f"/api/admin/performances/{perf['id']}", None),
+        ]
+        for method, path, body in attempts:
+            status, _, data = client.request(method, path, body, csrf=client.csrf)
+            self.assertEqual(status, 404, (method, path, data))
+            self.assertEqual(data["error"]["code"], "not_found")
+
+        status, _, data = self.client.get(f"/api/admin/events/{event['id']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["title"], "DNB NIGHT")
+        self.assertEqual(len(data["event"]["halls"]), 1)
+        self.assertEqual(
+            data["event"]["halls"][0]["performances"][0]["performer"], "DJ Vik")
+
+    def test_performer_hints_are_scoped_to_owner(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00")
+
+        self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+        status, _, data = client.get("/api/admin/performers")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["performers"], [])
+
+        own = self.create_event_as(client, title="OWN NIGHT")
+        status, _, data = client.post(
+            f"/api/admin/events/{own['id']}/halls", {"name": "Зал"},
+            csrf=client.csrf)
+        self.assertEqual(status, 201, data)
+        hall_id = data["hall"]["id"]
+        status, _, data = client.post(
+            f"/api/admin/halls/{hall_id}/performances",
+            {"performer": "DJ Solo", "startsAt": "2027-11-04T20:00",
+             "endsAt": "2027-11-04T21:00"},
+            csrf=client.csrf)
+        self.assertEqual(status, 201, data)
+
+        status, _, data = client.get("/api/admin/performers")
+        self.assertEqual(data["performers"], ["DJ Solo"])
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertEqual(sorted(data["performers"]), ["DJ Solo", "DJ Vik"])
+
+    def test_super_deletes_performer_hint(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "DJ Vik",
+                      "2027-11-04T20:00", "2027-11-04T21:00")
+
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertIn("DJ Vik", data["performers"])
+
+        # Имя ищется без учёта регистра и удаляется из всех владельцев.
+        status, _, data = self.client.delete(
+            "/api/admin/performers?name=dj%20vik", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["deleted"], 1)
+
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertNotIn("DJ Vik", data["performers"])
+
+        status, _, data = self.client.get("/api/admin/audit")
+        actions = [entry["action"] for entry in data["entries"]]
+        self.assertIn("performer.delete", actions)
+
+        # Повторное удаление уже отсутствующего имени — 404.
+        status, _, data = self.client.delete(
+            "/api/admin/performers?name=DJ%20Vik", csrf=self.client.csrf)
+        self.assertEqual(status, 404, data)
+        self.assertEqual(data["error"]["code"], "not_found")
+
+    def test_only_super_can_delete_performer_hint(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "DJ Vik",
+                      "2027-11-04T20:00", "2027-11-04T21:00")
+
+        self.create_admin()
+        helper = self.login_as("helper", "helper-password-1")
+        status, _, data = helper.delete(
+            "/api/admin/performers?name=DJ%20Vik", csrf=helper.csrf)
+        self.assertEqual(status, 403, data)
+        self.assertEqual(data["error"]["code"], "forbidden")
+
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertIn("DJ Vik", data["performers"])
+
+    def test_deleting_performer_hides_artist_from_public_search(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "DJ Vik",
+                      "2027-11-04T20:00", "2027-11-04T21:00")
+
+        status, _, data = self.client.get("/api/public/artists?q=vik")
+        self.assertEqual([a["name"] for a in data["artists"]], ["DJ Vik"])
+
+        status, _, data = self.client.delete(
+            "/api/admin/performers?name=DJ%20Vik", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+
+        status, _, data = self.client.get("/api/public/artists?q=vik")
+        self.assertEqual(data["artists"], [])
+
+        # Удалённый артист пропадает и из списка «кто играет».
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertNotIn("DJ Vik", [a["name"] for a in data["artists"]])
+
+    def test_audit_log_records_actions(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        perf = self.add_perf(hall["id"], "DJ Vik",
+                             "2027-11-04T20:00", "2027-11-04T21:00")["performance"]
+        status, _, _ = self.client.patch(
+            f"/api/admin/performances/{perf['id']}",
+            {"performer": "DJ Vik 2"}, csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        status, _, _ = self.client.delete(
+            f"/api/admin/events/{event['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+
+        status, _, data = self.client.get("/api/admin/audit")
+        self.assertEqual(status, 200, data)
+        entries = data["entries"]
+        actions = [entry["action"] for entry in entries]
+        self.assertEqual(actions[0], "event.delete")
+        for action in ("event.create", "hall.create", "performance.create",
+                       "performance.update", "event.delete"):
+            self.assertIn(action, actions)
+        self.assertTrue(all(entry["actor"] == "admin" for entry in entries))
+        self.assertIn("DNB NIGHT", entries[0]["detail"])
+        self.assertIn("DJ Vik 2", entries[0]["detail"])
+
+    def test_audit_log_is_super_only(self):
+        self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+        status, _, data = client.get("/api/admin/audit")
+        self.assertEqual(status, 403)
+        self.assertEqual(data["error"]["code"], "forbidden")
+
+    def test_deleting_admin_transfers_events_to_super(self):
+        helper = self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+        own = self.create_event_as(client, title="HELPER NIGHT")
+
+        status, _, data = self.client.delete(
+            f"/api/admin/users/{helper['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+
+        status, _, data = self.client.get(f"/api/admin/events/{own['id']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["ownerUsername"], "admin")
+
+        status, _, data = self.client.get("/api/admin/audit")
+        user_entries = [entry for entry in data["entries"]
+                        if entry["action"] == "user.delete"]
+        self.assertEqual(len(user_entries), 1)
+        self.assertIn("helper", user_entries[0]["detail"])
+        self.assertIn("мероприятий передано: 1", user_entries[0]["detail"])
+
+    # -- анонс и скрытый лайнап ------------------------------------------
+
+    def test_hidden_lineup_is_announced_without_schedule(self):
+        event = self.create_event(
+            lineupVisible=False,
+            description="Скоро объявим лайнап",
+            links=[{"title": "Билеты", "url": "https://tickets.example/x"}])
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "Secret DJ",
+                      "2027-11-04T20:00", "2027-11-04T21:00")
+
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertEqual(status, 200, data)
+        public = data["event"]
+        self.assertEqual(public["id"], event["id"])
+        self.assertFalse(public["lineupVisible"])
+        self.assertEqual(public["halls"], [])
+        self.assertEqual(public["description"], "Скоро объявим лайнап")
+        self.assertEqual(len(public["links"]), 1)
+        self.assertNotIn("lineupPublishAt", public)
+
+        status, _, data = self.client.get("/api/public/events")
+        summary = next(item for item in data["events"] if item["id"] == event["id"])
+        self.assertEqual(summary["hallCount"], 0)
+        self.assertEqual(summary["performanceCount"], 0)
+        self.assertFalse(summary["lineupVisible"])
+
+        status, _, data = self.client.get(f"/api/admin/events/{event['id']}")
+        self.assertFalse(data["event"]["lineupVisible"])
+        self.assertEqual(len(data["event"]["halls"]), 1)
+        self.assertEqual(data["event"]["stats"]["performances"], 1)
+
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"lineupVisible": True},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertTrue(data["event"]["lineupVisible"])
+        self.assertEqual(len(data["event"]["halls"]), 1)
+
+    def test_lineup_opens_at_scheduled_time(self):
+        event = self.create_event(lineupVisible=True,
+                                  lineupPublishAt="2027-11-04T19:00")
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "Later DJ",
+                      "2027-11-04T20:00", "2027-11-04T21:00")
+
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertFalse(data["event"]["lineupVisible"])
+        self.assertEqual(data["event"]["halls"], [])
+        self.assertEqual(data["event"]["lineupPublishAt"], "2027-11-04T16:00:00Z")
+
+        conn = db.connect()
+        try:
+            conn.execute("UPDATE events SET lineup_publish_at = ? WHERE id = ?",
+                         ("2020-01-01T00:00:00Z", event["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+        status, _, data = self.client.get("/api/public/featured")
+        self.assertTrue(data["event"]["lineupVisible"])
+        self.assertEqual(len(data["event"]["halls"]), 1)
+
+    def test_invalid_lineup_schedule_is_rejected(self):
+        self.login()
+        status, _, data = self.client.post(
+            "/api/admin/events",
+            {"title": "Bad lineup", "venue": "Place",
+             "timezone": "Europe/Moscow",
+             "startsAt": "2027-11-04T20:00",
+             "endsAt": "2027-11-05T02:00",
+             "lineupPublishAt": "not-a-date"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+    # -- администраторы --------------------------------------------------
+
+    def test_super_can_manage_admins(self):
+        helper = self.create_admin()
+        self.assertFalse(helper["isSuper"])
+
+        status, _, data = self.client.get("/api/admin/users")
+        self.assertEqual(status, 200)
+        self.assertEqual([user["username"] for user in data["users"]],
+                         ["admin", "helper"])
+        self.assertTrue(data["users"][0]["isSuper"])
+        self.assertFalse(data["users"][1]["isSuper"])
+
+        status, _, data = self.client.patch(
+            f"/api/admin/users/{helper['id']}",
+            {"password": "another-secret-2"}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+
+        helper_client = self.login_as("helper", "another-secret-2")
+        status, _, _ = helper_client.get("/api/admin/events")
+        self.assertEqual(status, 200)
+
+        status, _, data = self.client.delete(
+            f"/api/admin/users/{helper['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, _ = helper_client.get("/api/admin/events")
+        self.assertEqual(status, 401)
+
+    def test_regular_admin_cannot_manage_admins(self):
+        helper = self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+        requests = [
+            ("GET", "/api/admin/users", None),
+            ("POST", "/api/admin/users",
+             {"username": "third", "password": "third-password-3"}),
+            ("PATCH", f"/api/admin/users/{helper['id']}",
+             {"password": "third-password-3"}),
+            ("DELETE", f"/api/admin/users/{helper['id']}", None),
+        ]
+        for method, path, body in requests:
+            status, _, data = client.request(method, path, body, csrf=client.csrf)
+            self.assertEqual(status, 403, (method, path, data))
+            self.assertEqual(data["error"]["code"], "forbidden")
+
+    def test_super_account_is_protected(self):
+        self.login()
+        status, _, data = self.client.post(
+            "/api/admin/users",
+            {"username": "Admin", "password": "duplicate-password"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 409, data)
+
+        status, _, data = self.client.patch(
+            f"/api/admin/users/{self.super_id}", {"password": "another-secret-2"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 403, data)
+
+        status, _, data = self.client.delete(
+            f"/api/admin/users/{self.super_id}", csrf=self.client.csrf)
+        self.assertEqual(status, 403, data)
+
+    def test_session_reports_super(self):
+        self.login()
+        status, _, data = self.client.get("/api/admin/session")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["user"]["isSuper"])
+
+    def test_xss_payload_stored_as_json(self):
+        event = self.create_event(title="<script>alert(1)</script>")
+        status, headers, data = self.client.get("/api/public/featured")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["event"]["title"], "<script>alert(1)</script>")
+        self.assertIn("application/json", headers["content-type"])
+
+    def test_unknown_api_returns_json_404(self):
+        status, headers, data = self.client.get("/api/public/nope")
+        self.assertEqual(status, 404)
+        self.assertIn("application/json", headers["content-type"])
+        self.assertEqual(data["error"]["code"], "not_found")
+
+    def test_method_not_allowed(self):
+        status, headers, _ = self.client.delete("/api/public/featured")
+        self.assertEqual(status, 405)
+        self.assertIn("allow", headers)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

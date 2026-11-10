@@ -1,0 +1,39 @@
+# /etc/systemd/system/lineup.service
+#
+# Пользователь lineup должен существовать:
+#   useradd --system --home /var/lib/lineup --shell /usr/sbin/nologin lineup
+# Каталог данных — /var/lib/lineup, права только у lineup.
+#
+# Приложение запускается gunicorn из venv внутри /var/www/lineup.
+
+[Unit]
+Description=LineUP (gunicorn)
+After=network.target
+
+[Service]
+Type=notify
+User=lineup
+Group=lineup
+WorkingDirectory=/var/www/lineup
+EnvironmentFile=/etc/lineup/lineup.env
+ExecStart=/var/www/lineup/.venv/bin/gunicorn \
+    --workers 3 \
+    --bind 127.0.0.1:8000 \
+    --access-logfile - \
+    --error-logfile - \
+    --timeout 30 \
+    app:app
+
+Restart=always
+RestartSec=3
+UMask=0077
+
+# Минимальные права: система только для чтения, запись — в каталог данных.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lineup
+
+[Install]
+WantedBy=multi-user.target
