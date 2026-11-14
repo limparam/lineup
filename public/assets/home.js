@@ -2,13 +2,14 @@ import {
   api,
   clear,
   el,
+  loadSiteChrome,
   nowMs,
   plural,
   renderEvent,
   renderEventRow,
   setServerNow,
   startClock,
-} from "./common.js?v=7";
+} from "./common.js?v=14";
 
 const featuredHost = document.getElementById("featured");
 const section = document.getElementById("afisha");
@@ -91,6 +92,8 @@ async function load() {
 
 if (yearHost) yearHost.textContent = String(new Date().getFullYear());
 
+loadSiteChrome();
+
 startClock((now) => {
   if (controller) controller.update(now);
 });
@@ -100,3 +103,4 @@ setInterval(load, 30000);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") load();
 });
+window.addEventListener("focus", load);

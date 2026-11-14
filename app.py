@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import mimetypes
@@ -361,6 +364,21 @@ def _perf_admin_json(row, tz: str) -> dict:
 
 MAX_EVENT_LINKS = 12
 
+MAX_SITE_LINKS = 8
+SITE_LOGO_KEY = "logo_png"
+# 180 КБ в base64 занимают меньше 256 КБ, лимита тела запроса.
+MAX_LOGO_BYTES = 180 * 1024
+MAX_LOGO_SIDE = 5000
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+LINEUP_FILTERS = ("all", "live", "played")
+
+
+def _lineup_filter(row) -> str:
+    """Жёстко выбранный фильтр расписания; неизвестное значение — «все»."""
+    value = row["lineup_filter"] if "lineup_filter" in row.keys() else "all"
+    return value if value in LINEUP_FILTERS else "all"
+
 
 def _event_json(conn, row, *, admin: bool = False) -> dict:
     lineup_visible = _lineup_is_visible(row)
@@ -409,6 +427,7 @@ def _event_json(conn, row, *, admin: bool = False) -> dict:
                   for link in link_rows],
         "halls": hall_items,
         "lineupVisible": lineup_visible,
+        "lineupFilter": _lineup_filter(row),
     }
     if admin:
         data.update({
@@ -462,7 +481,153 @@ def _event_summary(conn, row, *, admin: bool = False) -> dict:
         "hallCount": hall_count,
         "performanceCount": perf_count,
         "lineupVisible": lineup_visible,
+        "lineupFilter": _lineup_filter(row),
     }
+
+
+def _site_logo_row(conn):
+    return conn.execute(
+        "SELECT value, updated_at FROM site_settings WHERE key = ?",
+        (SITE_LOGO_KEY,),
+    ).fetchone()
+
+
+def _site_logo_info(conn) -> dict:
+    row = _site_logo_row(conn)
+    if not row or not row["value"]:
+        return {
+            "logoUrl": None,
+            "logoVersion": None,
+            "logoUpdatedAt": None,
+            "logoBytes": 0,
+        }
+    data = row["value"]
+    if not isinstance(data, (bytes, bytearray)):
+        data = str(data).encode("utf-8")
+    data = bytes(data)
+    version = hashlib.sha256(data).hexdigest()[:16]
+    return {
+        "logoUrl": f"/logo?v={version}",
+        "logoVersion": version,
+        "logoUpdatedAt": row["updated_at"] or None,
+        "logoBytes": len(data),
+    }
+
+
+def _site_links(conn) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id, label, description, url FROM site_links "
+        "ORDER BY position, id"
+    ).fetchall()
+    return [{
+        "id": row["id"],
+        "label": row["label"],
+        "description": row["description"],
+        "url": row["url"],
+    } for row in rows]
+
+
+def _normalize_site_links(data: dict) -> list[dict]:
+    raw = data.get("links")
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise APIError(400, "validation", "Кнопки должны быть списком.")
+    if len(raw) > MAX_SITE_LINKS:
+        raise APIError(400, "validation",
+                       f"Можно добавить не больше {MAX_SITE_LINKS} кнопок.")
+    links = []
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise APIError(400, "validation", f"Кнопка №{index} заполнена неверно.")
+        label = item.get("label") or ""
+        description = item.get("description") or ""
+        url = item.get("url") or ""
+        if not all(isinstance(value, str)
+                   for value in (label, description, url)):
+            raise APIError(400, "validation",
+                           f"Кнопка №{index} заполнена неверно.")
+        label = label.strip()
+        description = description.strip()
+        url = url.strip()
+        if not label:
+            raise APIError(400, "validation", f"Укажите название кнопки №{index}.")
+        if len(label) > 60:
+            raise APIError(400, "validation",
+                           f"Название кнопки №{index} длиннее 60 символов.")
+        if len(description) > 1200:
+            raise APIError(400, "validation",
+                           f"Описание кнопки №{index} длиннее 1200 символов.")
+        if not description and not url:
+            raise APIError(400, "validation",
+                           f"Заполните описание или ссылку кнопки №{index}.")
+        if len(url) > 500:
+            raise APIError(400, "validation",
+                           f"Ссылка кнопки №{index} длиннее 500 символов.")
+        if url:
+            lowered = url.lower()
+            if not (lowered.startswith("http://")
+                    or lowered.startswith("https://")):
+                raise APIError(400, "validation",
+                               f"Ссылка кнопки №{index} должна начинаться "
+                               f"с http:// или https://.")
+            if any(ch.isspace() or ord(ch) < 32 for ch in url):
+                raise APIError(400, "validation",
+                               f"Ссылка кнопки №{index} содержит "
+                               f"недопустимые символы.")
+        links.append({
+            "label": label,
+            "description": description,
+            "url": url,
+        })
+    return links
+
+
+def _replace_site_links(conn, links: list[dict]) -> None:
+    conn.execute("DELETE FROM site_links")
+    now = timeutil.iso_now()
+    for position, link in enumerate(links, start=1):
+        conn.execute(
+            "INSERT INTO site_links (label, description, url, position, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (link["label"], link["description"], link["url"], position, now),
+        )
+
+
+def _decode_logo_payload(data: dict) -> bytes:
+    raw = data.get("data")
+    if not isinstance(raw, str) or not raw.strip():
+        raise APIError(400, "validation", "Передайте PNG-файл.")
+    value = raw.strip()
+    if value.lower().startswith("data:"):
+        header, separator, payload = value.partition(",")
+        if not separator or not header.lower().startswith("data:image/png;base64"):
+            raise APIError(400, "validation", "Ожидается PNG-файл.")
+        value = payload
+    value = "".join(value.split())
+    try:
+        blob = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raise APIError(400, "validation", "Не удалось прочитать PNG-файл.") from None
+    if len(blob) > MAX_LOGO_BYTES:
+        raise APIError(
+            413, "too_large",
+            f"Логотип больше {MAX_LOGO_BYTES // 1024} КБ.",
+        )
+    if not blob.startswith(PNG_SIGNATURE):
+        raise APIError(400, "validation", "Логотип должен быть PNG-файлом.")
+    if len(blob) < 33 or blob[12:16] != b"IHDR":
+        raise APIError(400, "validation", "PNG-файл повреждён.")
+    width = int.from_bytes(blob[16:20], "big")
+    height = int.from_bytes(blob[20:24], "big")
+    if not width or not height:
+        raise APIError(400, "validation", "PNG-файл повреждён.")
+    if width > MAX_LOGO_SIDE or height > MAX_LOGO_SIDE:
+        raise APIError(
+            400, "validation",
+            f"Размер логотипа не должен превышать {MAX_LOGO_SIDE}×{MAX_LOGO_SIDE} px.",
+        )
+    return blob
 
 
 def _cookie_suffix(req: Request) -> str:
@@ -576,6 +741,15 @@ def _lineup_is_visible(row, now_iso: str | None = None) -> bool:
     return True
 
 
+def _set_is_visible(row, now_iso: str, lineup_filter: str) -> bool:
+    """Сет виден публично с учётом жёсткого фильтра расписания."""
+    if lineup_filter == "live":
+        return row["starts_at"] <= now_iso < row["ends_at"]
+    if lineup_filter == "played":
+        return row["starts_at"] <= now_iso
+    return True
+
+
 def _rate_limited(conn, ip: str, username: str) -> bool:
     since = int(time.time()) - LOGIN_WINDOW_SECONDS
     by_ip = conn.execute(
@@ -652,6 +826,30 @@ def favicon(req):
     return _serve_static(req, "favicon.svg", cache="public, max-age=604800")
 
 
+@route(r"/logo")
+def site_logo(req):
+    conn = db.connect()
+    try:
+        row = _site_logo_row(conn)
+        if not row or not row["value"]:
+            raise APIError(404, "not_found", "Логотип не загружен.")
+        data = row["value"]
+        if not isinstance(data, (bytes, bytearray)):
+            data = str(data).encode("utf-8")
+        data = bytes(data)
+        etag = f'W/"{hashlib.sha256(data).hexdigest()[:16]}"'
+        headers = {
+            "ETag": etag,
+            "Cache-Control": "public, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if req.headers.get("if-none-match") == etag:
+            return Response(b"", 304, headers=headers)
+        return Response(data, 200, content_type="image/png", headers=headers)
+    finally:
+        conn.close()
+
+
 @route(r"/healthz")
 def health(req):
     conn = db.connect()
@@ -718,6 +916,17 @@ def api_public_events(req):
         conn.close()
 
 
+@route(r"/api/public/site")
+def api_public_site(req):
+    conn = db.connect()
+    try:
+        data = {"links": _site_links(conn), "serverNow": timeutil.iso_now()}
+        data.update(_site_logo_info(conn))
+        return json_response(data)
+    finally:
+        conn.close()
+
+
 @route(r"/api/public/events/([a-z0-9-]{1,80})")
 def api_public_event(req, slug):
     conn = db.connect()
@@ -753,8 +962,8 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
             item = {
                 "name": name.strip(),
                 "events": {},
-                "hasVisible": False,
-                "hasHidden": False,
+                "hasPublicEvent": False,
+                "hasHiddenLineup": False,
             }
             artists[key] = item
         return item
@@ -771,7 +980,7 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
         "SELECT p.performer, p.starts_at, p.ends_at, h.name AS hall_name, "
         "e.id AS event_id, e.slug, e.title, e.city, e.venue, e.timezone, "
         "e.starts_at AS event_starts, e.ends_at AS event_ends, "
-        "e.published, e.lineup_visible, e.lineup_publish_at "
+        "e.published, e.lineup_visible, e.lineup_publish_at, e.lineup_filter "
         "FROM performances p "
         "JOIN halls h ON h.id = p.hall_id "
         "JOIN events e ON e.id = h.event_id "
@@ -791,9 +1000,12 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
             continue
         if not _lineup_is_visible(row, now_iso):
             # Не раскрываем артистов из скрытого лайнапа.
-            item["hasHidden"] = True
+            item["hasHiddenLineup"] = True
             continue
-        item["hasVisible"] = True
+
+        # Мероприятие с опубликованным лайнапом показываем всегда, даже если
+        # время конкретного сета скрыто жёстким фильтром расписания.
+        item["hasPublicEvent"] = True
         event = item["events"].get(row["event_id"])
         if event is None:
             event = {
@@ -808,6 +1020,16 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
                 "sets": [],
             }
             item["events"][row["event_id"]] = event
+
+        lineup_filter = (
+            row["lineup_filter"] if row["lineup_filter"] in LINEUP_FILTERS
+            else "all"
+        )
+        if not _set_is_visible(row, now_iso, lineup_filter):
+            # Время сета пока не публично: артист и мероприятие остаются
+            # видимыми, но время выступления не отдаём.
+            continue
+
         event["sets"].append({
             "hall": row["hall_name"],
             "startsAt": row["starts_at"],
@@ -819,11 +1041,11 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
     for item in artists.values():
         if needle and needle not in _artist_key(item["name"]):
             continue
-        if not needle and not item["hasVisible"]:
+        if not needle and not item["hasPublicEvent"]:
             continue
         # Если артист есть только в скрытых лайнапах текущих мероприятий,
         # не показываем его даже в поиске.
-        if not item["hasVisible"] and item["hasHidden"]:
+        if not item["hasPublicEvent"] and item["hasHiddenLineup"]:
             continue
         events = sorted(item["events"].values(), key=lambda ev: ev["startsAt"])
         for event in events:
@@ -1134,6 +1356,84 @@ def api_admin_user_delete(req, user_id):
 
 
 # --------------------------------------------------------------------------
+# Админка: оформление сайта (только главный)
+# --------------------------------------------------------------------------
+
+@route(r"/api/admin/site")
+def api_admin_site(req):
+    _require_super(req, csrf=False)
+    conn = db.connect()
+    try:
+        data = {"links": _site_links(conn)}
+        data.update(_site_logo_info(conn))
+        data.update({
+            "maxLinks": MAX_SITE_LINKS,
+            "maxLogoBytes": MAX_LOGO_BYTES,
+            "maxLogoSide": MAX_LOGO_SIDE,
+        })
+        return json_response(data)
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/site/links", methods=("PUT", "PATCH"))
+def api_admin_site_links(req):
+    session = _require_super(req)
+    data = req.json()
+    links = _normalize_site_links(data)
+    conn = db.connect()
+    try:
+        _replace_site_links(conn, links)
+        _audit(conn, session, "site.links", entity="site", detail=(
+            f"кнопок: {len(links)}"
+            + (f" · {', '.join(item['label'] for item in links)}" if links else "")
+        ))
+        conn.commit()
+        return json_response({"links": _site_links(conn)})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/site/logo", methods=("PUT", "POST"))
+def api_admin_site_logo_upload(req):
+    session = _require_super(req)
+    blob = _decode_logo_payload(req.json())
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO site_settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (SITE_LOGO_KEY, sqlite3.Binary(blob), timeutil.iso_now()),
+        )
+        _audit(conn, session, "site.logo", entity="site",
+               detail=f"PNG-логотип, {len(blob) // 1024} КБ")
+        conn.commit()
+        data = _site_logo_info(conn)
+        return json_response({"ok": True, **data})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/site/logo", methods=("DELETE",))
+def api_admin_site_logo_delete(req):
+    session = _require_super(req)
+    conn = db.connect()
+    try:
+        deleted = conn.execute(
+            "DELETE FROM site_settings WHERE key = ?", (SITE_LOGO_KEY,)
+        ).rowcount
+        if deleted:
+            _audit(conn, session, "site.logo", entity="site",
+                   detail="логотип удалён")
+        conn.commit()
+        return json_response({"ok": True, "deleted": bool(deleted),
+                              **_site_logo_info(conn)})
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
 # Админка: мероприятия
 # --------------------------------------------------------------------------
 
@@ -1231,6 +1531,17 @@ def _normalize_event(data: dict, current=None) -> dict:
     published = _bool_field(data, "published", bool(current.get("published", 1)))
     lineup_visible = _bool_field(
         data, "lineupVisible", bool(current.get("lineup_visible", 1)))
+    raw_filter = data.get("lineupFilter")
+    if raw_filter in (None, ""):
+        lineup_filter = current.get("lineup_filter", "all") or "all"
+    elif not isinstance(raw_filter, str):
+        raise APIError(400, "validation",
+                       "Некорректный фильтр расписания.")
+    else:
+        lineup_filter = raw_filter.strip().lower()
+    if lineup_filter not in LINEUP_FILTERS:
+        raise APIError(400, "validation",
+                       "Фильтр расписания: допустимо all, live или played.")
     if "lineupPublishAt" in data:
         raw_publish = data.get("lineupPublishAt")
         if raw_publish in (None, ""):
@@ -1253,6 +1564,7 @@ def _normalize_event(data: dict, current=None) -> dict:
         "published": 1 if published else 0,
         "lineup_visible": 1 if lineup_visible else 0,
         "lineup_publish_at": lineup_publish_at,
+        "lineup_filter": lineup_filter,
     }
 
 
@@ -1307,13 +1619,14 @@ def api_admin_event_create(req):
         cur = conn.execute(
             "INSERT INTO events (slug, title, city, venue, address, description, "
             "timezone, starts_at, ends_at, published, owner_id, lineup_visible, "
-            "lineup_publish_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "lineup_publish_at, lineup_filter, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (slug, fields["title"], fields["city"], fields["venue"],
              fields["address"], fields["description"], fields["timezone"],
              fields["starts_at"], fields["ends_at"], fields["published"],
              session["user_id"], fields["lineup_visible"],
-             fields["lineup_publish_at"], timeutil.iso_now()),
+             fields["lineup_publish_at"], fields["lineup_filter"],
+             timeutil.iso_now()),
         )
         event_id = int(cur.lastrowid)
         links = _normalize_links(data)
@@ -1353,11 +1666,11 @@ def api_admin_event_update(req, event_id):
         conn.execute(
             "UPDATE events SET title=?, city=?, venue=?, address=?, description=?, "
             "timezone=?, starts_at=?, ends_at=?, published=?, lineup_visible=?, "
-            "lineup_publish_at=? WHERE id=?",
+            "lineup_publish_at=?, lineup_filter=? WHERE id=?",
             (fields["title"], fields["city"], fields["venue"], fields["address"],
              fields["description"], fields["timezone"], fields["starts_at"],
              fields["ends_at"], fields["published"], fields["lineup_visible"],
-             fields["lineup_publish_at"], row["id"]),
+             fields["lineup_publish_at"], fields["lineup_filter"], row["id"]),
         )
         links = _normalize_links(data)
         if links is not None:

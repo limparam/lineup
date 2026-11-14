@@ -3,10 +3,11 @@ import {
   clear,
   el,
   formatRangeShort,
+  loadSiteChrome,
   plural,
   setServerNow,
   timeStr,
-} from "./common.js?v=7";
+} from "./common.js?v=14";
 
 const host = document.getElementById("artists");
 const input = document.getElementById("artist-search");
@@ -15,8 +16,12 @@ const countHost = document.getElementById("artists-count");
 const yearHost = document.getElementById("year");
 if (yearHost) yearHost.textContent = String(new Date().getFullYear());
 
+loadSiteChrome();
+
 let debounceTimer = null;
 let requestId = 0;
+let lastArtistsKey = "";
+let failed = false;
 
 function skeleton() {
   clear(host).append(
@@ -46,7 +51,12 @@ function eventRow(event) {
       el("div", { class: "artist-event__main" }, [
         el("div", { class: "artist-event__title", text: event.title }),
         place ? el("div", { class: "artist-event__place", text: place }) : null,
-        sets.length ? el("div", { class: "artist-event__sets" }, sets) : null,
+        sets.length
+          ? el("div", { class: "artist-event__sets" }, sets)
+          : el("div", {
+              class: "artist-event__hidden",
+              text: "Точное время выступления не показано",
+            }),
       ]),
       el("div", {
         class: "artist-event__date",
@@ -121,7 +131,7 @@ function renderArtists(artists, query) {
   }
 }
 
-async function load(query) {
+async function load(query, { background = false } = {}) {
   const id = ++requestId;
   const params = new URLSearchParams();
   if (query) params.set("q", query);
@@ -131,9 +141,20 @@ async function load(query) {
     const data = await api(`/api/public/artists${suffix}`);
     if (id !== requestId) return;
     setServerNow(data.serverNow);
-    renderArtists(data.artists || [], data.query || query);
+    failed = false;
+
+    // Обновляем список только при изменениях: сеты появляются здесь, когда
+    // становятся видимыми в расписании мероприятия.
+    const artists = data.artists || [];
+    const effectiveQuery = data.query || query;
+    const key = JSON.stringify({ artists, query: effectiveQuery });
+    if (key === lastArtistsKey) return;
+    lastArtistsKey = key;
+    renderArtists(artists, effectiveQuery);
   } catch (error) {
     if (id !== requestId) return;
+    failed = true;
+    if (background && lastArtistsKey) return;
     clear(host).append(
       emptyState("Не удалось загрузить артистов", error.message),
     );
@@ -147,8 +168,23 @@ function scheduleLoad() {
   debounceTimer = setTimeout(() => load(query), 220);
 }
 
+function refresh() {
+  load(input.value.trim(), { background: true });
+}
+
 input.addEventListener("input", scheduleLoad);
 input.addEventListener("search", scheduleLoad);
 
 skeleton();
 load("");
+
+// Скрытые жёстким фильтром сеты должны появляться в разделе артистов сами,
+// когда наступает их время: перечитываем данные без перезагрузки страницы.
+setInterval(refresh, 30000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") refresh();
+});
+window.addEventListener("focus", refresh);
+window.addEventListener("online", () => {
+  if (failed) refresh();
+});

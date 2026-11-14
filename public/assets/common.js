@@ -387,6 +387,129 @@ export function renderEvent(host, event, { title } = {}) {
   let totalPerformances = 0;
   let totalHalls = 0;
 
+  const FILTERS = [
+    { id: "all", label: "Все", hint: "Показать все сеты" },
+    {
+      id: "live",
+      label: "Сейчас играют",
+      hint: "Показать только тех, кто играет сейчас",
+    },
+    {
+      id: "played",
+      label: "Отыграли и играют",
+      hint: "Показать тех, кто уже отыграл, и тех, кто играет сейчас",
+    },
+  ];
+  const lineupFilter =
+    event.lineupFilter === "live" || event.lineupFilter === "played"
+      ? event.lineupFilter
+      : "all";
+  const filterLocked = lineupFilter !== "all";
+  let activeFilter = lineupFilter;
+  const filterButtons = new Map();
+  const filtersHost = el(
+    "div",
+    {
+      class: "schedule__filters",
+      attrs: { role: "group", "aria-label": "Фильтр расписания" },
+    },
+    FILTERS.map((filter) => {
+      const button = el("button", {
+        class: "schedule-filter",
+        type: "button",
+        text: filter.label,
+        attrs: {
+          title: filter.hint,
+          "aria-pressed": filter.id === lineupFilter ? "true" : "false",
+        },
+        dataset: { filter: filter.id },
+      });
+      button.addEventListener("click", () => {
+        if (filterLocked) return;
+        activeFilter = filter.id;
+        syncScheduleFilters();
+        applyScheduleFilter(nowMs());
+      });
+      filterButtons.set(filter.id, button);
+      return button;
+    }),
+  );
+
+  const emptyTitle = el("h3", { class: "schedule__empty-title" });
+  const emptyText = el("p", { class: "schedule__empty-text" });
+  const emptyState = el(
+    "div",
+    { class: "schedule__empty", hidden: true, attrs: { role: "status" } },
+    [emptyTitle, emptyText],
+  );
+
+  function syncScheduleFilters() {
+    for (const [id, button] of filterButtons) {
+      button.setAttribute("aria-pressed", String(id === activeFilter));
+    }
+  }
+
+  function setScheduleEmpty(kind, now) {
+    if (activeFilter === "live") {
+      if (kind === "past") {
+        setText(emptyTitle, "Сейчас никто не играет");
+        setText(emptyText, "Все сеты уже отыграли.");
+      } else if (kind === "live") {
+        const anyStarted = slotRecords.some((record) => now >= record.start);
+        if (anyStarted) {
+          setText(emptyTitle, "Сейчас антракт");
+          setText(emptyText, "Ни один сет не идёт прямо сейчас. Загляните чуть позже.");
+        } else {
+          setText(emptyTitle, "Сейчас никто не играет");
+          setText(emptyText, "Первый сет ещё не начался.");
+        }
+      } else {
+        setText(emptyTitle, "Сейчас никто не играет");
+        setText(emptyText, "Первый сет ещё не начался.");
+      }
+      return;
+    }
+
+    if (kind === "live") {
+      setText(emptyTitle, "Пока никто не отыграл");
+      setText(emptyText, "Первый сет ещё не начался.");
+    } else if (kind === "upcoming") {
+      setText(emptyTitle, "Ещё никто не отыграл");
+      setText(emptyText, "Первый сет ещё не начался.");
+    } else {
+      setText(emptyTitle, "Нет отыгравших сетов");
+      setText(emptyText, "Расписание пока пустое.");
+    }
+  }
+
+  function slotMatchesFilter(record, now) {
+    if (activeFilter === "live") return now >= record.start && now < record.end;
+    if (activeFilter === "played") return now >= record.start;
+    return true;
+  }
+
+  function applyScheduleFilter(now) {
+    if (!lineupVisible) return;
+
+    let visibleSlots = 0;
+    for (const hall of hallRecords) {
+      let hallMatches = 0;
+      for (const record of hall.slots) {
+        const show = slotMatchesFilter(record, now);
+        if (record.node.hidden === show) record.node.hidden = !show;
+        if (show) hallMatches += 1;
+      }
+      const showHall = activeFilter === "all" || hallMatches > 0;
+      if (hall.node.hidden === showHall) hall.node.hidden = !showHall;
+      visibleSlots += hallMatches;
+    }
+
+    const showEmpty =
+      totalPerformances > 0 && activeFilter !== "all" && visibleSlots === 0;
+    emptyState.hidden = !showEmpty;
+    if (showEmpty) setScheduleEmpty(eventStatus(event, now), now);
+  }
+
   for (const hall of event.halls) {
     totalHalls += 1;
     totalPerformances += hall.performances.length;
@@ -453,6 +576,8 @@ export function renderEvent(host, event, { title } = {}) {
     hallRecords.push(hallRecord);
   }
 
+  filtersHost.hidden = filterLocked || totalPerformances === 0;
+
   const schedule = el("section", { class: "schedule" }, [
     el("div", { class: "schedule__head" }, [
       el("h2", { class: "section-title", text: "Расписание" }),
@@ -466,7 +591,9 @@ export function renderEvent(host, event, { title } = {}) {
         )}`,
       }),
     ]),
+    filtersHost,
     hallsHost,
+    emptyState,
   ]);
 
   if (!lineupVisible) {
@@ -547,6 +674,8 @@ export function renderEvent(host, event, { title } = {}) {
       }
     }
 
+    applyScheduleFilter(now);
+
     const chips = [];
     for (const item of livePerf) {
       chips.push(
@@ -604,4 +733,114 @@ export function plural(count, one, few, many) {
 export function skeletons(host, count = 2) {
   clear(host);
   for (let i = 0; i < count; i += 1) host.append(el("div", { class: "skeleton" }));
+}
+
+/* ---------------------------------------------------------- site chrome */
+
+const brandWordmarks = new WeakMap();
+let siteDialog = null;
+
+function applyBrandLogo(brand, logoUrl) {
+  if (!brandWordmarks.has(brand)) {
+    brandWordmarks.set(
+      brand,
+      [...brand.childNodes].map((node) => node.cloneNode(true)),
+    );
+  }
+  const current = brand.dataset.siteLogo || "";
+  if (logoUrl) {
+    if (current === logoUrl) return;
+    brand.dataset.siteLogo = logoUrl;
+    brand.classList.add("brand--logo");
+    brand.replaceChildren(
+      el("img", { class: "brand__logo", src: logoUrl, alt: "LineUP" }),
+    );
+    return;
+  }
+  if (current) {
+    delete brand.dataset.siteLogo;
+    brand.classList.remove("brand--logo");
+    brand.replaceChildren(
+      ...brandWordmarks.get(brand).map((node) => node.cloneNode(true)),
+    );
+  }
+}
+
+function ensureSiteDialog() {
+  if (siteDialog) return siteDialog;
+  const title = el("h2", { class: "site-dialog__title" });
+  const text = el("p", { class: "site-dialog__text" });
+  const link = el("a", {
+    class: "btn btn--primary",
+    href: "#",
+    target: "_blank",
+    rel: "noopener noreferrer nofollow",
+    text: "Перейти по ссылке ↗",
+  });
+  let dialog;
+  const close = el("button", {
+    class: "btn btn--ghost",
+    type: "button",
+    text: "Закрыть",
+    onClick: () => dialog.close(),
+  });
+  dialog = el("dialog", { id: "site-dialog", class: "site-dialog" }, [
+    title,
+    text,
+    el("div", { class: "site-dialog__actions" }, [link, close]),
+  ]);
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+  document.body.append(dialog);
+  siteDialog = { dialog, title, text, link };
+  return siteDialog;
+}
+
+function openSiteDialog(linkData) {
+  const nodes = ensureSiteDialog();
+  nodes.title.textContent = linkData.label || "";
+  nodes.text.textContent =
+    linkData.description || "Описание пока не добавлено.";
+  if (linkData.url) {
+    nodes.link.href = linkData.url;
+    nodes.link.hidden = false;
+  } else {
+    nodes.link.hidden = true;
+  }
+  nodes.dialog.showModal();
+}
+
+export function renderSiteChrome(data) {
+  const logoUrl = data && data.logoUrl ? data.logoUrl : "";
+  for (const brand of document.querySelectorAll("a.brand")) {
+    applyBrandLogo(brand, logoUrl);
+  }
+
+  const footer = document.getElementById("footer-links");
+  if (!footer) return;
+  clear(footer);
+  const links = data && Array.isArray(data.links) ? data.links : [];
+  footer.hidden = links.length === 0;
+  for (const link of links) {
+    footer.append(
+      el("button", {
+        class: "footer__link",
+        type: "button",
+        text: link.label,
+        onClick: () => openSiteDialog(link),
+      }),
+    );
+  }
+}
+
+export async function loadSiteChrome() {
+  try {
+    const data = await api("/api/public/site");
+    renderSiteChrome(data);
+    return data;
+  } catch {
+    // Оформление сайта не критично для основного содержимого.
+    return null;
+  }
 }

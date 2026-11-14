@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=7">
+  <link rel="stylesheet" href="/assets/style.css?v=14">
 </head>
 <body>
   <header class="adminbar">
@@ -16,6 +16,7 @@
     </a>
     <span class="adminbar__spacer"></span>
     <span class="adminbar__user" id="who"></span>
+    <button class="btn btn--ghost btn--sm" id="site-btn" type="button" hidden>Сайт</button>
     <button class="btn btn--ghost btn--sm" id="performers-btn" type="button" hidden>Артисты</button>
     <button class="btn btn--ghost btn--sm" id="audit-btn" type="button" hidden>Журнал</button>
     <button class="btn btn--ghost btn--sm" id="users-btn" type="button" hidden>Админы</button>
@@ -114,12 +115,18 @@
 
             <div class="field">
               <label for="f-starts">Начало</label>
-              <input id="f-starts" type="datetime-local" step="60" required>
+              <input id="f-starts" type="text" class="dt-input" inputmode="numeric"
+                     autocomplete="off" spellcheck="false" maxlength="16"
+                     placeholder="ДД.ММ.ГГГГ ЧЧ:ММ" required>
+              <span class="field__hint">Формат: ДД.ММ.ГГГГ ЧЧ:ММ, 24 часа.</span>
             </div>
 
             <div class="field">
               <label for="f-ends">Конец</label>
-              <input id="f-ends" type="datetime-local" step="60" required>
+              <input id="f-ends" type="text" class="dt-input" inputmode="numeric"
+                     autocomplete="off" spellcheck="false" maxlength="16"
+                     placeholder="ДД.ММ.ГГГГ ЧЧ:ММ" required>
+              <span class="field__hint">Формат: ДД.ММ.ГГГГ ЧЧ:ММ, 24 часа.</span>
             </div>
 
             <div class="field">
@@ -148,10 +155,27 @@
             </label>
 
             <div class="field">
-              <label for="f-lineup-publish">Открыть лайнап автоматически <span class="muted">(необязательно)</span></label>
-              <input id="f-lineup-publish" type="datetime-local" step="60">
+              <label for="f-lineup-filter">Кого показывать в расписании</label>
+              <select id="f-lineup-filter">
+                <option value="all">Все сеты — зритель может переключать</option>
+                <option value="live">Только те, кто играет сейчас</option>
+                <option value="played">Отыграли и играют сейчас</option>
+              </select>
               <span class="field__hint">
-                Пока дата не наступила, зрители видят только анонс без залов и артистов.
+                «Все сеты» оставляет на публичной странице кнопки фильтра.
+                Остальные варианты жёстко фиксируют показ: зритель увидит только
+                выбранные сеты и не сможет переключиться.
+              </span>
+            </div>
+
+            <div class="field">
+              <label for="f-lineup-publish">Открыть лайнап автоматически <span class="muted">(необязательно)</span></label>
+              <input id="f-lineup-publish" type="text" class="dt-input" inputmode="numeric"
+                     autocomplete="off" spellcheck="false" maxlength="16"
+                     placeholder="ДД.ММ.ГГГГ ЧЧ:ММ">
+              <span class="field__hint">
+                Формат: ДД.ММ.ГГГГ ЧЧ:ММ, 24 часа. Пока дата не наступила,
+                зрители видят только анонс без залов и артистов.
                 Галочка «Показывать лайнап» должна быть включена. Снимите её, чтобы
                 скрыть расписание полностью.
               </span>
@@ -282,7 +306,64 @@
         <div class="users-list" id="performers-admin"></div>
       </div>
     </section>
-  </main>
+    <!-- Оформление сайта (только супер) ---------------------------------- -->
+    <section id="view-site" hidden>
+      <div class="admin-head">
+        <div>
+          <button class="btn btn--ghost btn--sm" id="site-back" type="button">← К мероприятиям</button>
+          <h1 class="admin-title">Сайт</h1>
+          <p class="admin-sub">
+            Логотип вместо надписи LineUP и кнопки в подвале публичных страниц.
+          </p>
+        </div>
+      </div>
+
+      <div class="admin-grid admin-grid--site">
+        <div class="panel">
+          <div class="panel__head">
+            <h2 class="panel__title">Логотип</h2>
+            <span class="muted small" id="site-logo-size"></span>
+          </div>
+          <div class="site-logo-preview" id="site-logo-preview"></div>
+          <div class="field mt-md">
+            <label for="site-logo-file">PNG-файл</label>
+            <input id="site-logo-file" type="file" accept="image/png,.png">
+            <span class="field__hint" id="site-logo-hint">
+              Только PNG, до 180 КБ. Логотип показывается в шапке всех публичных
+              страниц вместо надписи LineUP.
+            </span>
+          </div>
+          <p class="field__hint" id="site-logo-status"></p>
+          <div class="form-actions">
+            <button class="btn btn--primary" id="site-logo-upload" type="button">
+              Загрузить логотип
+            </button>
+            <button class="btn btn--danger" id="site-logo-remove" type="button" hidden>
+              Убрать логотип
+            </button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel__head">
+            <h2 class="panel__title">Кнопки в подвале</h2>
+            <span class="muted small" id="site-links-count"></span>
+          </div>
+          <p class="field__hint">
+            Кнопки «О проекте», «Контакты» и другие. По клику открывается описание;
+            ссылка необязательна. Название и описание можно менять в любое время.
+          </p>
+          <div class="site-links-editor" id="site-links-list"></div>
+          <div class="form-actions">
+            <button class="btn" id="site-add-link" type="button">+ Добавить кнопку</button>
+            <span class="spacer"></span>
+            <button class="btn btn--primary" id="site-save-links" type="button">
+              Сохранить кнопки
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
 
   <dialog id="account-dialog">
     <h2>Сменить пароль</h2>
@@ -332,6 +413,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=7"></script>
+  <script type="module" src="/assets/admin.js?v=14"></script>
 </body>
 </html>

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -30,6 +32,11 @@ import timeutil  # noqa: E402
 
 PASSWORD = "correct-horse-battery"
 
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
 
 class Client:
     """Мини-клиент поверх WSGI-приложения."""
@@ -38,6 +45,7 @@ class Client:
         self.testcase = testcase
         self.cookies = {}
         self.csrf = None
+        self.last_body = b""
 
     def request(self, method, path, body=None, *, csrf=None,
                 scheme="http", ip="127.0.0.1"):
@@ -77,6 +85,7 @@ class Client:
 
         chunks = appmod.app(environ, start_response)
         raw = b"".join(chunks)
+        self.last_body = raw
         headers = {name.lower(): value for name, value in captured["headers"]}
 
         cookie = headers.get("set-cookie")
@@ -103,6 +112,9 @@ class Client:
     def patch(self, path, body=None, **kwargs):
         return self.request("PATCH", path, body, **kwargs)
 
+    def put(self, path, body=None, **kwargs):
+        return self.request("PUT", path, body, **kwargs)
+
     def delete(self, path, **kwargs):
         return self.request("DELETE", path, **kwargs)
 
@@ -111,8 +123,9 @@ class LineUPTestCase(unittest.TestCase):
     def setUp(self):
         db.init()
         conn = db.connect()
-        for table in ("audit_log", "performers", "performances", "halls",
-                      "event_links", "events", "sessions", "login_attempts", "users"):
+        for table in ("site_links", "site_settings", "audit_log", "performers",
+                      "performances", "halls", "event_links", "events",
+                      "sessions", "login_attempts", "users"):
             conn.execute(f"DELETE FROM {table}")
         cursor = conn.execute(
             "INSERT INTO users (username, password_hash, is_super, created_at) "
@@ -620,6 +633,88 @@ class LineUPTestCase(unittest.TestCase):
         status, _, data = self.client.get("/api/public/artists?q=secret")
         self.assertEqual(data["artists"], [])
 
+    def test_artists_hide_times_for_filtered_sets(self):
+        now = timeutil.now_utc().replace(second=0, microsecond=0)
+        tz = "Europe/Moscow"
+
+        def local(dt):
+            return timeutil.to_local_input(dt, tz)
+
+        event = self.create_event(
+            title="FILTERED ARTISTS",
+            startsAt=local(now - timedelta(minutes=90)),
+            endsAt=local(now + timedelta(hours=4)),
+            lineupFilter="played",
+        )
+        hall = self.add_hall(event["id"])
+        self.add_perf(
+            hall["id"], "Past DJ",
+            local(now - timedelta(minutes=80)),
+            local(now - timedelta(minutes=20)),
+        )
+        self.add_perf(
+            hall["id"], "Past DJ",
+            local(now + timedelta(minutes=130)),
+            local(now + timedelta(minutes=190)),
+        )
+        self.add_perf(
+            hall["id"], "Live DJ",
+            local(now - timedelta(minutes=10)),
+            local(now + timedelta(minutes=50)),
+        )
+        self.add_perf(
+            hall["id"], "Future DJ",
+            local(now + timedelta(minutes=60)),
+            local(now + timedelta(minutes=120)),
+        )
+
+        # Режим «отыграли и играют»: будущий сет показываем без времени,
+        # а у видимого артиста оставляем только уже начавшийся сет.
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertEqual(status, 200, data)
+        artists = {item["name"]: item for item in data["artists"]}
+        self.assertIn("Past DJ", artists)
+        self.assertIn("Live DJ", artists)
+        self.assertIn("Future DJ", artists)
+        self.assertEqual(len(artists["Future DJ"]["events"]), 1)
+        self.assertEqual(artists["Future DJ"]["events"][0]["sets"], [])
+        past_sets = artists["Past DJ"]["events"][0]["sets"]
+        self.assertEqual(len(past_sets), 1)
+        self.assertEqual(past_sets[0]["startsAt"],
+                         timeutil.to_iso(now - timedelta(minutes=80)))
+
+        status, _, data = self.client.get("/api/public/artists?q=future")
+        self.assertEqual([item["name"] for item in data["artists"]],
+                         ["Future DJ"])
+        self.assertEqual(data["artists"][0]["events"][0]["sets"], [])
+
+        # Режим «сейчас играют»: прошедшие и будущие сеты без времени,
+        # но артисты и мероприятия остаются на странице.
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"lineupFilter": "live"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, data = self.client.get("/api/public/artists")
+        artists = {item["name"]: item for item in data["artists"]}
+        self.assertIn("Past DJ", artists)
+        self.assertIn("Live DJ", artists)
+        self.assertIn("Future DJ", artists)
+        self.assertEqual(artists["Past DJ"]["events"][0]["sets"], [])
+        self.assertEqual(len(artists["Live DJ"]["events"][0]["sets"]), 1)
+        self.assertEqual(artists["Future DJ"]["events"][0]["sets"], [])
+
+        # Без жёсткого фильтра снова видны все сеты.
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"lineupFilter": "all"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, data = self.client.get("/api/public/artists")
+        artists = {item["name"]: item for item in data["artists"]}
+        self.assertIn("Past DJ", artists)
+        self.assertIn("Live DJ", artists)
+        self.assertIn("Future DJ", artists)
+        self.assertEqual(len(artists["Past DJ"]["events"][0]["sets"]), 2)
+
     def test_performer_database_survives_perf_delete(self):
         event = self.create_event()
         hall = self.add_hall(event["id"])
@@ -972,6 +1067,108 @@ class LineUPTestCase(unittest.TestCase):
             csrf=self.client.csrf)
         self.assertEqual(status, 400, data)
 
+    # -- жёсткий фильтр расписания ---------------------------------------
+
+    def test_lineup_filter_defaults_and_persistence(self):
+        event = self.create_event()
+        self.assertEqual(event["lineupFilter"], "all")
+
+        status, _, data = self.client.get(f"/api/public/events/{event['slug']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["lineupFilter"], "all")
+
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"lineupFilter": "live"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["lineupFilter"], "live")
+
+        status, _, data = self.client.get(f"/api/admin/events/{event['id']}")
+        self.assertEqual(data["event"]["lineupFilter"], "live")
+
+        status, _, data = self.client.get("/api/admin/events")
+        admin_item = next(item for item in data["events"]
+                          if item["id"] == event["id"])
+        self.assertEqual(admin_item["lineupFilter"], "live")
+
+        status, _, data = self.client.get("/api/public/events")
+        summary = next(item for item in data["events"]
+                       if item["id"] == event["id"])
+        self.assertEqual(summary["lineupFilter"], "live")
+
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"lineupFilter": "played"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["lineupFilter"], "played")
+
+        status, _, data = self.client.get(f"/api/public/events/{event['slug']}")
+        self.assertEqual(data["event"]["lineupFilter"], "played")
+
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"lineupFilter": "all"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["lineupFilter"], "all")
+
+    def test_invalid_lineup_filter_is_rejected(self):
+        event = self.create_event()
+
+        status, _, data = self.client.patch(
+            f"/api/admin/events/{event['id']}", {"lineupFilter": "future"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+        status, _, data = self.client.get(f"/api/admin/events/{event['id']}")
+        self.assertEqual(data["event"]["lineupFilter"], "all")
+
+        status, _, data = self.client.post(
+            "/api/admin/events",
+            {"title": "Bad filter", "venue": "Place",
+             "timezone": "Europe/Moscow",
+             "startsAt": "2027-11-04T20:00",
+             "endsAt": "2027-11-05T02:00",
+             "lineupFilter": "hidden"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+    def test_old_database_gets_lineup_filter_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.db"
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.executescript(
+                    "CREATE TABLE events ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "slug TEXT NOT NULL UNIQUE, "
+                    "title TEXT NOT NULL, "
+                    "city TEXT NOT NULL DEFAULT '', "
+                    "venue TEXT NOT NULL, "
+                    "address TEXT NOT NULL DEFAULT '', "
+                    "description TEXT NOT NULL DEFAULT '', "
+                    "timezone TEXT NOT NULL, "
+                    "starts_at TEXT NOT NULL, "
+                    "ends_at TEXT NOT NULL, "
+                    "published INTEGER NOT NULL DEFAULT 1, "
+                    "created_at TEXT NOT NULL"
+                    ");"
+                    "INSERT INTO events "
+                    "(slug, title, venue, timezone, starts_at, ends_at, created_at) "
+                    "VALUES ('old', 'OLD', 'Club', 'Europe/Moscow', "
+                    "'2027-11-04T20:00:00Z', '2027-11-05T02:00:00Z', "
+                    "'2027-01-01T00:00:00Z');"
+                )
+                db.init(conn)
+                columns = {row["name"]
+                           for row in conn.execute("PRAGMA table_info(events)")}
+                self.assertIn("lineup_filter", columns)
+                value = conn.execute(
+                    "SELECT lineup_filter FROM events").fetchone()[0]
+                self.assertEqual(value, "all")
+            finally:
+                conn.close()
+
     # -- администраторы --------------------------------------------------
 
     def test_super_can_manage_admins(self):
@@ -1038,6 +1235,151 @@ class LineUPTestCase(unittest.TestCase):
         status, _, data = self.client.get("/api/admin/session")
         self.assertEqual(status, 200)
         self.assertTrue(data["user"]["isSuper"])
+
+    # -- оформление сайта ------------------------------------------------
+
+    def test_public_site_defaults(self):
+        status, _, data = self.client.get("/api/public/site")
+        self.assertEqual(status, 200)
+        self.assertIsNone(data["logoUrl"])
+        self.assertEqual(data["links"], [])
+        self.assertIn("serverNow", data)
+
+        status, _, _ = self.client.get("/logo")
+        self.assertEqual(status, 404)
+
+    def test_super_manages_site_links(self):
+        self.login()
+        payload = {"links": [
+            {"label": "О проекте", "description": "LineUP — афиша и расписание.",
+             "url": ""},
+            {"label": "Контакты", "description": "Напишите нам.",
+             "url": "https://t.me/lineup"},
+        ]}
+        status, _, data = self.client.put(
+            "/api/admin/site/links", payload, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual([link["label"] for link in data["links"]],
+                         ["О проекте", "Контакты"])
+
+        status, _, data = self.client.get("/api/public/site")
+        self.assertEqual(status, 200)
+        self.assertEqual([link["label"] for link in data["links"]],
+                         ["О проекте", "Контакты"])
+        self.assertEqual(data["links"][1]["url"], "https://t.me/lineup")
+
+        status, _, data = self.client.put(
+            "/api/admin/site/links",
+            {"links": [{"label": "Контакты 2",
+                        "description": "Новое описание.", "url": ""}]},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual([link["label"] for link in data["links"]],
+                         ["Контакты 2"])
+
+        status, _, data = self.client.put(
+            "/api/admin/site/links", {"links": []}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["links"], [])
+
+    def test_site_links_validation(self):
+        self.login()
+        bad_variants = [
+            [{"label": "", "description": "x", "url": ""}],
+            [{"label": "x", "description": "", "url": ""}],
+            [{"label": "x" * 61, "description": "x", "url": ""}],
+            [{"label": "x", "description": "x" * 1201, "url": ""}],
+            [{"label": "x", "description": "x", "url": "javascript:alert(1)"}],
+            [{"label": "x", "description": "x", "url": "ftp://example.com"}],
+            [{"label": f"Кнопка {i}", "description": "x", "url": ""}
+             for i in range(9)],
+        ]
+        for links in bad_variants:
+            status, _, data = self.client.put(
+                "/api/admin/site/links", {"links": links},
+                csrf=self.client.csrf)
+            self.assertEqual(status, 400, (links, data))
+
+    def test_regular_admin_cannot_manage_site(self):
+        helper = self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+        requests = [
+            ("GET", "/api/admin/site", None),
+            ("PUT", "/api/admin/site/links",
+             {"links": [{"label": "x", "description": "y", "url": ""}]}),
+            ("PUT", "/api/admin/site/logo", {"data": "x"}),
+            ("DELETE", "/api/admin/site/logo", None),
+        ]
+        for method, path, body in requests:
+            status, _, data = client.request(
+                method, path, body, csrf=client.csrf)
+            self.assertEqual(status, 403, (method, path, data))
+            self.assertEqual(data["error"]["code"], "forbidden")
+
+    def test_logo_upload_and_remove(self):
+        self.login()
+        status, _, data = self.client.put(
+            "/api/admin/site/logo",
+            {"data": base64.b64encode(PNG_BYTES).decode("ascii")},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertIsNotNone(data["logoUrl"])
+        logo_url = data["logoUrl"]
+
+        status, headers, _ = self.client.get(logo_url)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["content-type"], "image/png")
+        self.assertEqual(self.client.last_body, PNG_BYTES)
+
+        status, _, public = self.client.get("/api/public/site")
+        self.assertEqual(status, 200)
+        self.assertEqual(public["logoUrl"], logo_url)
+
+        status, _, data = self.client.delete(
+            "/api/admin/site/logo", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertIsNone(data["logoUrl"])
+
+        status, _, _ = self.client.get(logo_url)
+        self.assertEqual(status, 404)
+        status, _, public = self.client.get("/api/public/site")
+        self.assertIsNone(public["logoUrl"])
+
+    def test_logo_validation(self):
+        self.login()
+        bad_variants = [
+            {"data": ""},
+            {"data": base64.b64encode(b"not a png").decode("ascii")},
+            {"data": "data:text/plain;base64,"
+                     + base64.b64encode(PNG_BYTES).decode("ascii")},
+            {"data": "%%%"},
+        ]
+        for payload in bad_variants:
+            status, _, data = self.client.put(
+                "/api/admin/site/logo", payload, csrf=self.client.csrf)
+            self.assertEqual(status, 400, (payload, data))
+
+        too_big = PNG_BYTES + b"0" * (
+            appmod.MAX_LOGO_BYTES + 1 - len(PNG_BYTES))
+        status, _, data = self.client.put(
+            "/api/admin/site/logo",
+            {"data": base64.b64encode(too_big).decode("ascii")},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 413, data)
+
+    def test_site_tables_are_created(self):
+        conn = db.connect()
+        try:
+            tables = {
+                row["name"] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        finally:
+            conn.close()
+        self.assertIn("site_links", tables)
+        self.assertIn("site_settings", tables)
 
     def test_xss_payload_stored_as_json(self):
         event = self.create_event(title="<script>alert(1)</script>")

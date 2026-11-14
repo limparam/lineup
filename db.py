@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS events (
     owner_id          INTEGER REFERENCES users(id) ON DELETE SET NULL,
     lineup_visible    INTEGER NOT NULL DEFAULT 1,
     lineup_publish_at TEXT,
+    lineup_filter     TEXT NOT NULL DEFAULT 'all',
     created_at        TEXT NOT NULL
 );
 
@@ -95,6 +96,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at TEXT NOT NULL
 );
 
+-- Кнопки в подвале публичных страниц (управляет главный администратор).
+CREATE TABLE IF NOT EXISTS site_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    label       TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    url         TEXT NOT NULL DEFAULT '',
+    position    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
+-- Настройки сайта: PNG-логотип и другие данные в формате ключ-значение.
+CREATE TABLE IF NOT EXISTS site_settings (
+    key        TEXT PRIMARY KEY,
+    value      BLOB NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_starts   ON events(starts_at);
 CREATE INDEX IF NOT EXISTS idx_links_event     ON event_links(event_id, position);
 CREATE INDEX IF NOT EXISTS idx_halls_event     ON halls(event_id, position);
@@ -106,6 +124,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_exp    ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_ts     ON login_attempts(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_created   ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_event     ON audit_log(event_id);
+CREATE INDEX IF NOT EXISTS idx_site_links_pos  ON site_links(position, id);
 """
 
 
@@ -171,6 +190,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     if "lineup_publish_at" not in event_columns:
         conn.execute("ALTER TABLE events ADD COLUMN lineup_publish_at TEXT")
+    if "lineup_filter" not in event_columns:
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN lineup_filter TEXT NOT NULL DEFAULT 'all'"
+        )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_owner ON events(owner_id)")
 
     # Старые мероприятия без владельца передаём старейшему главному администратору.

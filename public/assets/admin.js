@@ -5,7 +5,7 @@ import {
   eventStatus,
   formatRangeShort,
   plural,
-} from "./common.js?v=7";
+} from "./common.js?v=14";
 
 const $ = (id) => document.getElementById(id);
 
@@ -15,6 +15,7 @@ const eventView = $("view-event");
 const usersView = $("view-users");
 const auditView = $("view-audit");
 const performersView = $("view-performers");
+const siteView = $("view-site");
 const loginForm = $("login-form");
 const loginError = $("login-error");
 const setupHint = $("setup-hint");
@@ -67,12 +68,14 @@ function showView(name) {
   usersView.hidden = name !== "users";
   auditView.hidden = name !== "audit";
   performersView.hidden = name !== "performers";
+  siteView.hidden = name !== "site";
   const authed = name !== "login";
   $("logout-btn").hidden = !authed;
   $("account-btn").hidden = !authed;
   $("users-btn").hidden = !(authed && isSuper);
   $("audit-btn").hidden = !(authed && isSuper);
   $("performers-btn").hidden = !(authed && isSuper);
+  $("site-btn").hidden = !(authed && isSuper);
 }
 
 async function request(path, options = {}) {
@@ -116,6 +119,74 @@ function addMinutesLocal(value, minutes) {
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(
     date.getUTCDate(),
   )}T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+const DISPLAY_DATE_RE =
+  /^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})[\s,]+(\d{1,2}):(\d{2})$/;
+
+function localToDisplay(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(
+    String(value || ""),
+  );
+  if (!match) return String(value || "");
+  return `${match[3]}.${match[2]}.${match[1]} ${match[4]}:${match[5]}`;
+}
+
+function displayToLocal(value) {
+  const match = DISPLAY_DATE_RE.exec(String(value || "").trim());
+  if (!match) return null;
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  if (
+    year < 2000 ||
+    year > 2100 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour > 23 ||
+    minute > 59
+  ) {
+    return null;
+  }
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}`;
+}
+
+function normalizeDateTimeField(input) {
+  if (!input) return;
+  const value = input.value.trim();
+  if (!value) return;
+  const local = displayToLocal(value);
+  if (local) input.value = localToDisplay(local);
+}
+
+function dateTimeInput(value, ariaLabel, className = "") {
+  const input = el("input", {
+    type: "text",
+    class: `dt-input${className ? ` ${className}` : ""}`,
+    maxlength: "16",
+    value: localToDisplay(value),
+    placeholder: "ДД.ММ.ГГГГ ЧЧ:ММ",
+    attrs: {
+      "aria-label": ariaLabel,
+      inputmode: "numeric",
+      autocomplete: "off",
+      spellcheck: "false",
+    },
+  });
+  input.addEventListener("blur", () => normalizeDateTimeField(input));
+  return input;
 }
 
 function zonedNowLocal(tz) {
@@ -336,12 +407,15 @@ function fillEventForm() {
   $("f-venue").value = current.venue;
   $("f-address").value = current.address;
   $("f-timezone").value = current.timezone;
-  $("f-starts").value = current.startsAtLocal;
-  $("f-ends").value = current.endsAtLocal;
+  $("f-starts").value = localToDisplay(current.startsAtLocal);
+  $("f-ends").value = localToDisplay(current.endsAtLocal);
   $("f-description").value = current.description;
   $("f-published").checked = current.published;
   $("f-lineup-visible").checked = current.lineupVisible !== false;
-  $("f-lineup-publish").value = current.lineupPublishAtLocal || "";
+  $("f-lineup-filter").value = current.lineupFilter || "all";
+  $("f-lineup-publish").value = current.lineupPublishAtLocal
+    ? localToDisplay(current.lineupPublishAtLocal)
+    : "";
   renderLinks(current.links || []);
 
   $("event-title").textContent = current.title || "Мероприятие";
@@ -387,20 +461,16 @@ function performanceRow(hall, performance) {
     placeholder: "Имя исполнителя",
     attrs: { "aria-label": "Исполнитель" },
   });
-  const startInput = el("input", {
-    type: "datetime-local",
-    step: "60",
-    class: "perf-start",
-    value: performance.startsAtLocal,
-    attrs: { "aria-label": "Начало сета" },
-  });
-  const endInput = el("input", {
-    type: "datetime-local",
-    step: "60",
-    class: "perf-end",
-    value: performance.endsAtLocal,
-    attrs: { "aria-label": "Конец сета" },
-  });
+  const startInput = dateTimeInput(
+    performance.startsAtLocal,
+    "Начало сета",
+    "perf-start",
+  );
+  const endInput = dateTimeInput(
+    performance.endsAtLocal,
+    "Конец сета",
+    "perf-end",
+  );
 
   const save = el("button", {
     class: "btn btn--sm",
@@ -416,14 +486,20 @@ function performanceRow(hall, performance) {
         toast("Укажите начало и конец сета", "error");
         return;
       }
+      const startsAt = displayToLocal(startInput.value);
+      const endsAt = displayToLocal(endInput.value);
+      if (!startsAt || !endsAt) {
+        toast("Дата и время сета: ДД.ММ.ГГГГ ЧЧ:ММ", "error");
+        return;
+      }
       setBusy(save, true);
       try {
         const data = await request(`/api/admin/performances/${performance.id}`, {
           method: "PATCH",
           body: {
             performer,
-            startsAt: startInput.value,
-            endsAt: endInput.value,
+            startsAt,
+            endsAt,
           },
         });
         const index = hall.performances.findIndex((p) => p.id === performance.id);
@@ -477,18 +553,8 @@ function createPerfAddForm(hall) {
     placeholder: "Имя диджея",
     attrs: { list: "performers-list", "aria-label": "Новый исполнитель" },
   });
-  const start = el("input", {
-    type: "datetime-local",
-    step: "60",
-    value: times.start,
-    attrs: { "aria-label": "Начало нового сета" },
-  });
-  const end = el("input", {
-    type: "datetime-local",
-    step: "60",
-    value: times.end,
-    attrs: { "aria-label": "Конец нового сета" },
-  });
+  const start = dateTimeInput(times.start, "Начало нового сета", "perf-start");
+  const end = dateTimeInput(times.end, "Конец нового сета", "perf-end");
   const submit = el("button", { class: "btn btn--primary btn--sm", type: "submit", text: "+ Сет" });
 
   const form = el("form", { class: "perf-add", novalidate: true }, [name, start, end, submit]);
@@ -504,11 +570,17 @@ function createPerfAddForm(hall) {
       toast("Укажите начало и конец сета", "error");
       return;
     }
+    const startsAt = displayToLocal(start.value);
+    const endsAt = displayToLocal(end.value);
+    if (!startsAt || !endsAt) {
+      toast("Дата и время сета: ДД.ММ.ГГГГ ЧЧ:ММ", "error");
+      return;
+    }
     setBusy(submit, true);
     try {
       const data = await request(`/api/admin/halls/${hall.id}/performances`, {
         method: "POST",
-        body: { performer, startsAt: start.value, endsAt: end.value },
+        body: { performer, startsAt, endsAt },
       });
       hall.performances.push(data.performance);
       sortPerformances(hall);
@@ -663,10 +735,11 @@ function newEvent() {
   fillTimezoneSelect(tz);
   const times = defaultEventTimes(tz);
   $("f-city").value = "Москва";
-  $("f-starts").value = times.start;
-  $("f-ends").value = times.end;
+  $("f-starts").value = localToDisplay(times.start);
+  $("f-ends").value = localToDisplay(times.end);
   $("f-published").checked = true;
   $("f-lineup-visible").checked = true;
+  $("f-lineup-filter").value = "all";
   $("f-lineup-publish").value = "";
   $("f-title").value = "";
   $("f-venue").value = "";
@@ -685,26 +758,35 @@ function newEvent() {
 
 async function saveEvent(event) {
   event.preventDefault();
+  const startsAt = displayToLocal($("f-starts").value);
+  const endsAt = displayToLocal($("f-ends").value);
+  if (!startsAt || !endsAt) {
+    toast("Укажите начало и конец в формате ДД.ММ.ГГГГ ЧЧ:ММ", "error");
+    return;
+  }
+  const publishRaw = $("f-lineup-publish").value.trim();
+  const lineupPublishAt = publishRaw ? displayToLocal(publishRaw) : null;
+  if (publishRaw && !lineupPublishAt) {
+    toast("Дата открытия лайнапа: ДД.ММ.ГГГГ ЧЧ:ММ", "error");
+    return;
+  }
   const payload = {
     title: $("f-title").value.trim(),
     city: $("f-city").value.trim(),
     venue: $("f-venue").value.trim(),
     address: $("f-address").value.trim(),
     timezone: $("f-timezone").value,
-    startsAt: $("f-starts").value,
-    endsAt: $("f-ends").value,
+    startsAt,
+    endsAt,
     description: $("f-description").value.trim(),
     links: collectLinks(),
     published: $("f-published").checked,
     lineupVisible: $("f-lineup-visible").checked,
-    lineupPublishAt: $("f-lineup-publish").value || null,
+    lineupFilter: $("f-lineup-filter").value,
+    lineupPublishAt,
   };
   if (!payload.title || !payload.venue) {
     toast("Укажите название и место проведения", "error");
-    return;
-  }
-  if (!payload.startsAt || !payload.endsAt) {
-    toast("Укажите начало и конец мероприятия", "error");
     return;
   }
 
@@ -922,6 +1004,252 @@ async function deletePerformer(name) {
   }
 }
 
+/* ------------------------------------------------------------ сайт */
+
+let siteLogoUrl = null;
+let siteLogoBytes = 0;
+let siteMaxLinks = 8;
+let siteMaxLogoBytes = 180 * 1024;
+
+function formatBytes(bytes) {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} КБ`;
+  return `${bytes} Б`;
+}
+
+function renderSiteLogo() {
+  const host = $("site-logo-preview");
+  clear(host);
+  $("site-logo-size").textContent = siteLogoBytes ? formatBytes(siteLogoBytes) : "";
+  if (siteLogoUrl) {
+    host.append(
+      el("img", {
+        class: "site-logo-preview__img",
+        src: `${siteLogoUrl}${siteLogoUrl.includes("?") ? "&" : "?"}t=${Date.now()}`,
+        alt: "Логотип LineUP",
+      }),
+    );
+    $("site-logo-remove").hidden = false;
+    $("site-logo-status").textContent =
+      "На сайте вместо надписи LineUP показывается этот логотип.";
+  } else {
+    host.append(
+      el("span", { class: "brand" }, [
+        "Line",
+        el("span", { text: "UP" }),
+        el("i", { class: "brand__dot" }),
+      ]),
+    );
+    $("site-logo-remove").hidden = true;
+    $("site-logo-status").textContent =
+      "Логотип не загружен — на сайте показывается надпись LineUP.";
+  }
+}
+
+function applySiteLogo(data) {
+  siteLogoUrl = data.logoUrl || null;
+  siteLogoBytes = data.logoBytes || 0;
+  renderSiteLogo();
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    });
+    reader.addEventListener("error", () => {
+      reject(reader.error || new Error("Не удалось прочитать файл."));
+    });
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadSiteLogo() {
+  const input = $("site-logo-file");
+  const file = input.files && input.files[0];
+  if (!file) {
+    toast("Выберите PNG-файл", "error");
+    return;
+  }
+  if (file.size > siteMaxLogoBytes) {
+    toast(
+      `Файл больше ${formatBytes(siteMaxLogoBytes)}. Выберите изображение меньше.`,
+      "error",
+    );
+    return;
+  }
+  const button = $("site-logo-upload");
+  setBusy(button, true);
+  try {
+    const data = await request("/api/admin/site/logo", {
+      method: "PUT",
+      body: { data: await fileToBase64(file) },
+    });
+    applySiteLogo(data);
+    input.value = "";
+    toast("Логотип загружен");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function removeSiteLogo() {
+  if (!confirm("Убрать логотип? На сайте снова появится надпись LineUP.")) return;
+  const button = $("site-logo-remove");
+  setBusy(button, true);
+  try {
+    const data = await request("/api/admin/site/logo", { method: "DELETE" });
+    applySiteLogo(data);
+    $("site-logo-file").value = "";
+    toast("Логотип убран");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function updateSiteLinksCount() {
+  const count = $("site-links-list").querySelectorAll(".site-link-row").length;
+  $("site-links-count").textContent = count
+    ? `${count} из ${siteMaxLinks}`
+    : "";
+}
+
+function siteLinkRow(link = {}) {
+  const label = el("input", {
+    type: "text",
+    class: "site-link-row__label",
+    maxlength: "60",
+    value: link.label || "",
+    placeholder: "Название, например «О проекте»",
+    attrs: { "aria-label": "Название кнопки" },
+  });
+  const url = el("input", {
+    type: "url",
+    class: "site-link-row__url",
+    maxlength: "500",
+    value: link.url || "",
+    placeholder: "https://… (необязательно)",
+    attrs: {
+      "aria-label": "Ссылка кнопки",
+      inputmode: "url",
+      autocapitalize: "none",
+      spellcheck: "false",
+    },
+  });
+  const description = el("textarea", {
+    class: "site-link-row__description",
+    maxlength: "1200",
+    rows: "3",
+    text: link.description || "",
+    placeholder: "Описание, которое откроется по клику",
+    attrs: { "aria-label": "Описание кнопки" },
+  });
+  const row = el("div", { class: "site-link-row" }, [
+    el("div", { class: "site-link-row__top" }, [
+      label,
+      url,
+      el("button", {
+        class: "btn btn--sm btn--danger btn--icon",
+        type: "button",
+        text: "✕",
+        attrs: { "aria-label": "Удалить кнопку", title: "Удалить кнопку" },
+        onClick: () => {
+          row.remove();
+          if (!$("site-links-list").querySelector(".site-link-row")) {
+            renderSiteLinks([]);
+          } else {
+            updateSiteLinksCount();
+          }
+        },
+      }),
+    ]),
+    description,
+  ]);
+  return row;
+}
+
+function renderSiteLinks(links = []) {
+  const host = $("site-links-list");
+  clear(host);
+  if (!links.length) {
+    host.append(
+      el("div", {
+        class: "site-links-empty",
+        text: "Кнопок пока нет. Добавьте «О проекте», «Контакты» или другую кнопку.",
+      }),
+    );
+  } else {
+    for (const link of links) host.append(siteLinkRow(link));
+  }
+  updateSiteLinksCount();
+}
+
+function addSiteLink() {
+  const host = $("site-links-list");
+  if (host.querySelectorAll(".site-link-row").length >= siteMaxLinks) {
+    toast(`Можно добавить не больше ${siteMaxLinks} кнопок`, "error");
+    return;
+  }
+  const empty = host.querySelector(".site-links-empty");
+  if (empty) empty.remove();
+  const row = siteLinkRow();
+  host.append(row);
+  updateSiteLinksCount();
+  row.querySelector("input").focus();
+}
+
+function collectSiteLinks() {
+  const links = [];
+  for (const row of $("site-links-list").querySelectorAll(".site-link-row")) {
+    const label = row.querySelector(".site-link-row__label").value.trim();
+    const description = row
+      .querySelector(".site-link-row__description")
+      .value.trim();
+    const url = row.querySelector(".site-link-row__url").value.trim();
+    if (!label && !description && !url) continue;
+    links.push({ label, description, url });
+  }
+  return links;
+}
+
+async function saveSiteLinks() {
+  const button = $("site-save-links");
+  setBusy(button, true);
+  try {
+    const data = await request("/api/admin/site/links", {
+      method: "PUT",
+      body: { links: collectSiteLinks() },
+    });
+    renderSiteLinks(data.links || []);
+    toast("Кнопки сохранены");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function openSite() {
+  const data = await request("/api/admin/site");
+  siteMaxLinks = data.maxLinks || 8;
+  siteMaxLogoBytes = data.maxLogoBytes || 180 * 1024;
+  $("site-logo-hint").textContent =
+    `Только PNG, до ${formatBytes(siteMaxLogoBytes)}. Логотип показывается ` +
+    "в шапке всех публичных страниц вместо надписи LineUP.";
+  $("site-logo-file").value = "";
+  applySiteLogo(data);
+  renderSiteLinks(data.links || []);
+  showView("site");
+  window.scrollTo({ top: 0 });
+}
+
 /* ------------------------------------------------------------ журнал */
 
 const AUDIT_LABELS = {
@@ -935,6 +1263,8 @@ const AUDIT_LABELS = {
   "performance.update": "Изменил артиста",
   "performance.delete": "Удалил артиста",
   "performer.delete": "Удалил артиста из подсказок",
+  "site.links": "Изменил кнопки в подвале",
+  "site.logo": "Изменил логотип сайта",
   "user.create": "Добавил администратора",
   "user.update": "Сменил пароль администратора",
   "user.delete": "Удалил администратора",
@@ -1041,6 +1371,29 @@ $("logout-btn").addEventListener("click", async () => {
 $("new-event").addEventListener("click", newEvent);
 $("back-btn").addEventListener("click", () => {
   openList().catch((error) => toast(error.message, "error"));
+});
+for (const id of ["f-starts", "f-ends", "f-lineup-publish"]) {
+  $(id).addEventListener("blur", () => normalizeDateTimeField($(id)));
+}
+$("site-btn").addEventListener("click", () => {
+  openSite().catch((error) => toast(error.message, "error"));
+});
+$("site-back").addEventListener("click", () => {
+  openList().catch((error) => toast(error.message, "error"));
+});
+$("site-add-link").addEventListener("click", addSiteLink);
+$("site-save-links").addEventListener("click", saveSiteLinks);
+$("site-logo-upload").addEventListener("click", uploadSiteLogo);
+$("site-logo-remove").addEventListener("click", removeSiteLogo);
+$("site-logo-file").addEventListener("change", () => {
+  const file = $("site-logo-file").files && $("site-logo-file").files[0];
+  if (!file) {
+    $("site-logo-size").textContent = siteLogoBytes
+      ? formatBytes(siteLogoBytes)
+      : "";
+    return;
+  }
+  $("site-logo-size").textContent = `${file.name} · ${formatBytes(file.size)}`;
 });
 $("add-link").addEventListener("click", addLink);
 $("users-btn").addEventListener("click", () => {

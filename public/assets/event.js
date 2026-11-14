@@ -2,15 +2,18 @@ import {
   api,
   clear,
   el,
+  loadSiteChrome,
   renderEvent,
   setServerNow,
   startClock,
-} from "./common.js?v=7";
+} from "./common.js?v=14";
 
 const host = document.getElementById("event");
 const slug = decodeURIComponent(
   location.pathname.replace(/^\/e\//, "").replace(/\/+$/, ""),
 );
+
+loadSiteChrome();
 
 let controller = null;
 let lastEventJson = "";
@@ -62,6 +65,7 @@ setInterval(load, 30000);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") load();
 });
+window.addEventListener("focus", load);
 
 window.addEventListener("online", () => {
   if (failed) load();
