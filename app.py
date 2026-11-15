@@ -347,11 +347,14 @@ def _perf_row(conn, perf_id: int):
 
 
 def _perf_json(row) -> dict:
+    replacement = bool(row["is_replacement"]) if "is_replacement" in row.keys() else False
     return {
         "id": row["id"],
         "performer": row["performer"],
+        "displayPerformer": "Замена" if replacement else row["performer"],
         "startsAt": row["starts_at"],
         "endsAt": row["ends_at"],
+        "isReplacement": replacement,
     }
 
 
@@ -951,9 +954,21 @@ def _artist_key(name: str) -> str:
 
 
 def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
-    """Артисты с текущими публичными мероприятиями и поиск по всей базе."""
-    cutoff = _public_cutoff(now_iso)
+    """Артисты ближайших мероприятий с актуальными сетами.
+
+    Артист попадает в список, только если у него есть сет, который ещё не
+    закончился, в опубликованном мероприятии, которое ещё не закончилось.
+    Прошедшие мероприятия и отыгравшие сеты в разделе артистов не участвуют.
+    """
     artists: dict[str, dict] = {}
+    # Имена, которые главный администратор не удалил из базы исполнителей.
+    # Удалённое имя не должно находиться в публичном разделе, даже если сет
+    # остался в мероприятии.
+    known = {
+        _artist_key(row["name"])
+        for row in conn.execute("SELECT name FROM performers")
+        if (row["name"] or "").strip()
+    }
 
     def entry_for(name: str) -> dict:
         key = _artist_key(name)
@@ -962,19 +977,9 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
             item = {
                 "name": name.strip(),
                 "events": {},
-                "hasPublicEvent": False,
-                "hasHiddenLineup": False,
             }
             artists[key] = item
         return item
-
-    # Публичный список и поиск строятся только по базе исполнителей.
-    # Если главный администратор удалил имя из неё, артист перестаёт
-    # находиться через поиск, даже если его сет остался в мероприятии.
-    for row in conn.execute("SELECT name FROM performers"):
-        name = (row["name"] or "").strip()
-        if name:
-            entry_for(name)
 
     rows = conn.execute(
         "SELECT p.performer, p.starts_at, p.ends_at, h.name AS hall_name, "
@@ -984,28 +989,22 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
         "FROM performances p "
         "JOIN halls h ON h.id = p.hall_id "
         "JOIN events e ON e.id = h.event_id "
-        "WHERE e.published = 1"
+        "WHERE e.published = 1 AND p.is_replacement = 0 "
+        "AND e.ends_at > ? AND p.ends_at > ?",
+        (now_iso, now_iso),
     ).fetchall()
     for row in rows:
         name = (row["performer"] or "").strip()
         if not name:
             continue
-        item = artists.get(_artist_key(name))
-        if item is None:
+        if _artist_key(name) not in known:
             # Имя удалено из базы автозаполнения — не показываем артиста.
-            continue
-        if row["event_ends"] < cutoff:
-            # Прошедшее мероприятие уже не публично: имя остаётся в поиске,
-            # но событие не показываем.
             continue
         if not _lineup_is_visible(row, now_iso):
             # Не раскрываем артистов из скрытого лайнапа.
-            item["hasHiddenLineup"] = True
             continue
 
-        # Мероприятие с опубликованным лайнапом показываем всегда, даже если
-        # время конкретного сета скрыто жёстким фильтром расписания.
-        item["hasPublicEvent"] = True
+        item = entry_for(name)
         event = item["events"].get(row["event_id"])
         if event is None:
             event = {
@@ -1040,12 +1039,6 @@ def _public_artists(conn, now_iso: str, query: str = "") -> list[dict]:
     result = []
     for item in artists.values():
         if needle and needle not in _artist_key(item["name"]):
-            continue
-        if not needle and not item["hasPublicEvent"]:
-            continue
-        # Если артист есть только в скрытых лайнапах текущих мероприятий,
-        # не показываем его даже в поиске.
-        if not item["hasPublicEvent"] and item["hasHiddenLineup"]:
             continue
         events = sorted(item["events"].values(), key=lambda ev: ev["startsAt"])
         for event in events:
@@ -1698,10 +1691,12 @@ def api_admin_event_delete(req, event_id):
         parts = []
         for hall in hall_rows:
             perfs = conn.execute(
-                "SELECT performer FROM performances WHERE hall_id = ? "
-                "ORDER BY starts_at, id", (hall["id"],),
+                "SELECT performer, is_replacement FROM performances "
+                "WHERE hall_id = ? ORDER BY starts_at, id", (hall["id"],),
             ).fetchall()
-            names = ", ".join(p["performer"] for p in perfs)
+            names = ", ".join(
+                "Замена" if p["is_replacement"] else p["performer"]
+                for p in perfs)
             parts.append(f"{hall['name']}: {names}" if names else hall["name"])
         detail = f"{row['title']} ({row['slug']})"
         if parts:
@@ -1808,6 +1803,32 @@ def _remember_performer(conn: sqlite3.Connection, owner_id, name: str) -> None:
     )
 
 
+def _forget_performer_if_unused(conn: sqlite3.Connection, owner_id,
+                                name: str) -> None:
+    """Убирает имя из подсказок, если им больше не подписан ни один сет.
+
+    Нужно для замен: «Замена» и имена не приехавших артистов не должны
+    выглядеть как артисты в публичном списке.
+    """
+    name = (name or "").strip()
+    if not owner_id or not name:
+        return
+    still_used = conn.execute(
+        "SELECT 1 FROM performances p "
+        "JOIN halls h ON h.id = p.hall_id "
+        "JOIN events e ON e.id = h.event_id "
+        "WHERE e.owner_id = ? AND p.is_replacement = 0 "
+        "AND p.performer = ? COLLATE NOCASE LIMIT 1",
+        (owner_id, name),
+    ).fetchone()
+    if still_used:
+        return
+    conn.execute(
+        "DELETE FROM performers WHERE owner_id = ? AND name = ? COLLATE NOCASE",
+        (owner_id, name),
+    )
+
+
 def _performance_times(data: dict, tz: str, event_start: str, event_end: str,
                        *, current=None):
     def moment(key, column, label):
@@ -1846,9 +1867,10 @@ def _check_hall_overlap(conn, hall_id: int, starts, ends, tz: str,
     if conflict:
         label = timeutil.human_range(
             conflict["starts_at"], conflict["ends_at"], tz)
+        name = "Замена" if conflict["is_replacement"] else conflict["performer"]
         raise APIError(
             409, "overlap",
-            f"Время пересекается с «{conflict['performer']}» ({label}).",
+            f"Время пересекается с «{name}» ({label}).",
         )
 
 
@@ -1895,27 +1917,110 @@ def api_admin_perf_update(req, perf_id):
         event = _admin_event_row(conn, session, perf["event_id"])
         hall = _hall_row(conn, perf["hall_id"])
         tz = hall["event_timezone"]
-        performer = _str_field(data, "performer", "имя исполнителя", maxlen=120,
-                               current=perf["performer"])
+        if "isReplacement" not in data:
+            replacement = bool(perf["is_replacement"])
+        else:
+            value = data.get("isReplacement")
+            if not isinstance(value, bool):
+                raise APIError(400, "validation",
+                               "Некорректный признак замены.")
+            replacement = value
+        if replacement:
+            # Имя сохраняем, но публично показываем «Замена» и не добавляем
+            # его в базу артистов.
+            performer = perf["performer"]
+        else:
+            performer = _str_field(data, "performer", "имя исполнителя",
+                                   maxlen=120, current=perf["performer"])
         starts, ends = _performance_times(
             data, tz, hall["event_starts"], hall["event_ends"], current=perf)
         _check_hall_overlap(conn, hall["id"], starts, ends, tz,
                             exclude_id=perf["id"])
         conn.execute(
-            "UPDATE performances SET performer = ?, starts_at = ?, ends_at = ? "
-            "WHERE id = ?",
-            (performer, timeutil.to_iso(starts), timeutil.to_iso(ends), perf["id"]),
+            "UPDATE performances SET performer = ?, starts_at = ?, ends_at = ?, "
+            "is_replacement = ? WHERE id = ?",
+            (performer, timeutil.to_iso(starts), timeutil.to_iso(ends),
+             int(replacement), perf["id"]),
         )
-        _remember_performer(conn, event["owner_id"], performer)
+        if replacement:
+            _forget_performer_if_unused(conn, event["owner_id"], perf["performer"])
+        else:
+            _remember_performer(conn, event["owner_id"], performer)
+        changes = []
+        if perf["performer"] != performer:
+            changes.append(f"{perf['performer']} → {performer}")
+        if bool(perf["is_replacement"]) != replacement:
+            changes.append("замена" if replacement else "артист вернулся")
         _audit(conn, session, "performance.update", entity="performance",
                entity_id=perf["id"], event_id=event["id"],
                detail=(f"{event['title']} · {hall['name']} · "
-                       + (performer if perf["performer"] == performer
-                          else f"{perf['performer']} → {performer}")))
+                       + ("; ".join(changes) or performer)))
         conn.commit()
         row = conn.execute("SELECT * FROM performances WHERE id = ?",
                            (perf["id"],)).fetchone()
         return json_response({"performance": _perf_admin_json(row, tz)})
+    finally:
+        conn.close()
+
+
+def _perf_id_field(data: dict, key: str) -> int:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise APIError(400, "validation", "Укажите два сета для обмена.")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise APIError(400, "validation", "Укажите два сета для обмена.") from None
+    if number <= 0:
+        raise APIError(400, "validation", "Укажите два сета для обмена.")
+    return number
+
+
+@route(r"/api/admin/performances/swap", methods=("POST",))
+def api_admin_perf_swap(req):
+    """Меняет артистов местами, не трогая забронированное время сетов."""
+    session = _require_admin(req)
+    data = req.json()
+    first_id = _perf_id_field(data, "firstId")
+    second_id = _perf_id_field(data, "secondId")
+    if first_id == second_id:
+        raise APIError(400, "validation", "Выберите два разных сета.")
+    conn = db.connect()
+    try:
+        first = _perf_row(conn, first_id)
+        second = _perf_row(conn, second_id)
+        if first["event_id"] != second["event_id"]:
+            raise APIError(400, "validation",
+                           "Менять местами можно сеты одного мероприятия.")
+        event = _admin_event_row(conn, session, first["event_id"])
+        if (first["performer"] == second["performer"]
+                and bool(first["is_replacement"]) == bool(second["is_replacement"])):
+            raise APIError(400, "validation",
+                           "У выбранных сетов одинаковые артисты.")
+        first_hall = _hall_row(conn, first["hall_id"])["name"]
+        second_hall = _hall_row(conn, second["hall_id"])["name"]
+        conn.execute(
+            "UPDATE performances SET performer = ?, is_replacement = ? WHERE id = ?",
+            (second["performer"], second["is_replacement"], first["id"]),
+        )
+        conn.execute(
+            "UPDATE performances SET performer = ?, is_replacement = ? WHERE id = ?",
+            (first["performer"], first["is_replacement"], second["id"]),
+        )
+        _audit(conn, session, "performance.swap", entity="performance",
+               entity_id=first["id"], event_id=event["id"],
+               detail=(f"{event['title']} · "
+                       f"{first['performer']} ({first_hall}) ↔ "
+                       f"{second['performer']} ({second_hall})"))
+        conn.commit()
+        rows = [_perf_row(conn, first_id), _perf_row(conn, second_id)]
+        log.info("Артисты #%s и #%s поменялись местами (мероприятие #%s)",
+                 first_id, second_id, event["id"])
+        return json_response({
+            "performances": [
+                _perf_admin_json(row, row["event_timezone"]) for row in rows
+            ],
+        })
     finally:
         conn.close()
 

@@ -9,7 +9,7 @@ import {
   renderEventRow,
   setServerNow,
   startClock,
-} from "./common.js?v=14";
+} from "./common.js?v=16";
 
 const featuredHost = document.getElementById("featured");
 const section = document.getElementById("afisha");

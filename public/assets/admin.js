@@ -5,7 +5,7 @@ import {
   eventStatus,
   formatRangeShort,
   plural,
-} from "./common.js?v=14";
+} from "./common.js?v=16";
 
 const $ = (id) => document.getElementById(id);
 
@@ -44,6 +44,7 @@ let editingUserId = null;
 let timezones = [];
 let current = null;
 let allPerformers = [];
+const selectedPerfIds = new Set();
 
 /* --------------------------------------------------------------- utils */
 
@@ -308,6 +309,7 @@ function renderEventList(events) {
 
 async function openList() {
   const data = await request("/api/admin/events");
+  selectedPerfIds.clear();
   timezones = data.timezones || timezones;
   $("who").textContent = username;
   renderEventList(data.events);
@@ -452,6 +454,86 @@ function nextSlotTimes(hall) {
   return { start: slotStart, end: slotEnd };
 }
 
+function performanceLabel(performance) {
+  return performance && performance.isReplacement
+    ? "Замена"
+    : (performance && performance.performer) || "";
+}
+
+function findPerformance(id) {
+  for (const hall of (current && current.halls) || []) {
+    const performance = hall.performances.find((item) => item.id === id);
+    if (performance) return { hall, performance };
+  }
+  return null;
+}
+
+function updateSwapBar() {
+  const bar = $("swap-bar");
+  if (!bar) return;
+  if (!current) {
+    bar.hidden = true;
+    return;
+  }
+  const existing = new Set();
+  for (const hall of current.halls) {
+    for (const performance of hall.performances) existing.add(performance.id);
+  }
+  for (const id of [...selectedPerfIds]) {
+    if (!existing.has(id)) selectedPerfIds.delete(id);
+  }
+  const items = [...selectedPerfIds].map(findPerformance).filter(Boolean);
+  if (items.length !== 2) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  $("swap-text").textContent =
+    `${performanceLabel(items[0].performance)} ↔ ${performanceLabel(items[1].performance)}`;
+}
+
+function togglePerformanceSelection(performance, checked) {
+  if (!checked) {
+    selectedPerfIds.delete(performance.id);
+    updateSwapBar();
+    return true;
+  }
+  if (selectedPerfIds.size >= 2) {
+    toast("Можно выбрать только два сета", "error");
+    return false;
+  }
+  selectedPerfIds.add(performance.id);
+  updateSwapBar();
+  return true;
+}
+
+async function swapPerformances() {
+  const ids = [...selectedPerfIds];
+  if (ids.length !== 2) return;
+  const button = $("swap-apply");
+  setBusy(button, true);
+  try {
+    const data = await request("/api/admin/performances/swap", {
+      method: "POST",
+      body: { firstId: ids[0], secondId: ids[1] },
+    });
+    for (const updated of data.performances || []) {
+      const found = findPerformance(updated.id);
+      if (!found) continue;
+      const index = found.hall.performances.findIndex((p) => p.id === updated.id);
+      if (index >= 0) found.hall.performances[index] = updated;
+    }
+    selectedPerfIds.clear();
+    renderHalls();
+    loadPerformers();
+    toast("Артисты поменялись местами");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function performanceRow(hall, performance) {
   const nameInput = el("input", {
     type: "text",
@@ -472,16 +554,39 @@ function performanceRow(hall, performance) {
     "perf-end",
   );
 
+  const check = el("input", {
+    type: "checkbox",
+    class: "perf-check",
+    checked: selectedPerfIds.has(performance.id),
+    attrs: {
+      "aria-label": `Выбрать сет ${performanceLabel(performance)}`,
+      title: "Выбрать для обмена",
+    },
+  });
+  check.addEventListener("change", () => {
+    if (!togglePerformanceSelection(performance, check.checked)) {
+      check.checked = false;
+    }
+  });
+
+  const nameCell = el("div", { class: "perf-name-cell" });
+  if (performance.isReplacement) {
+    nameCell.append(
+      el("span", { class: "perf-replacement", text: "Замена" }),
+      el("span", {
+        class: "perf-replacement__note",
+        text: "артист не приехал — имя скрыто",
+      }),
+    );
+  } else {
+    nameCell.append(nameInput);
+  }
+
   const save = el("button", {
     class: "btn btn--sm",
     type: "button",
     text: "Сохранить",
     onClick: async () => {
-      const performer = nameInput.value.trim();
-      if (!performer) {
-        toast("Укажите имя исполнителя", "error");
-        return;
-      }
       if (!startInput.value || !endInput.value) {
         toast("Укажите начало и конец сета", "error");
         return;
@@ -492,15 +597,22 @@ function performanceRow(hall, performance) {
         toast("Дата и время сета: ДД.ММ.ГГГГ ЧЧ:ММ", "error");
         return;
       }
+      const body = { startsAt, endsAt };
+      if (performance.isReplacement) {
+        body.isReplacement = true;
+      } else {
+        const performer = nameInput.value.trim();
+        if (!performer) {
+          toast("Укажите имя исполнителя", "error");
+          return;
+        }
+        body.performer = performer;
+      }
       setBusy(save, true);
       try {
         const data = await request(`/api/admin/performances/${performance.id}`, {
           method: "PATCH",
-          body: {
-            performer,
-            startsAt,
-            endsAt,
-          },
+          body,
         });
         const index = hall.performances.findIndex((p) => p.id === performance.id);
         hall.performances[index] = data.performance;
@@ -516,13 +628,62 @@ function performanceRow(hall, performance) {
     },
   });
 
+  const toggleReplacement = el("button", {
+    class: "btn btn--sm" + (performance.isReplacement ? "" : " btn--ghost"),
+    type: "button",
+    text: performance.isReplacement ? "Вернуть" : "Замена",
+    attrs: {
+      "aria-label": performance.isReplacement
+        ? "Вернуть артиста в сет"
+        : "Отметить замену",
+      title: performance.isReplacement
+        ? "Вернуть артиста в сет"
+        : "Артист не приехал — показать «Замена»",
+    },
+    onClick: async () => {
+      const startsAt = displayToLocal(startInput.value);
+      const endsAt = displayToLocal(endInput.value);
+      if (!startsAt || !endsAt) {
+        toast("Дата и время сета: ДД.ММ.ГГГГ ЧЧ:ММ", "error");
+        return;
+      }
+      setBusy(toggleReplacement, true);
+      try {
+        const data = await request(`/api/admin/performances/${performance.id}`, {
+          method: "PATCH",
+          body: {
+            isReplacement: !performance.isReplacement,
+            startsAt,
+            endsAt,
+          },
+        });
+        const index = hall.performances.findIndex((p) => p.id === performance.id);
+        hall.performances[index] = data.performance;
+        renderHalls();
+        loadPerformers();
+        toast(
+          data.performance.isReplacement
+            ? "Отмечена замена: имя скрыто из списка артистов"
+            : "Артист возвращён в сет",
+        );
+      } catch (error) {
+        toast(error.message, "error");
+      } finally {
+        setBusy(toggleReplacement, false);
+      }
+    },
+  });
+
   const remove = el("button", {
     class: "btn btn--sm btn--danger btn--icon",
     type: "button",
     text: "✕",
-    attrs: { "aria-label": `Удалить сет ${performance.performer}`, title: "Удалить сет" },
+    attrs: {
+      "aria-label": `Удалить сет ${performanceLabel(performance)}`,
+      title: "Удалить сет",
+    },
     onClick: async () => {
-      if (!confirm(`Удалить выступление «${performance.performer}»?`)) return;
+      if (!confirm(`Удалить выступление «${performanceLabel(performance)}»?`)) return;
       setBusy(remove, true);
       try {
         await request(`/api/admin/performances/${performance.id}`, { method: "DELETE" });
@@ -538,10 +699,15 @@ function performanceRow(hall, performance) {
   });
 
   return el("div", { class: "perf-row" }, [
-    nameInput,
-    startInput,
-    endInput,
-    el("div", { class: "perf-row__actions" }, [save, remove]),
+    check,
+    el("div", { class: "perf-main" }, [
+      nameCell,
+      el("div", { class: "perf-times" }, [
+        startInput,
+        endInput,
+        el("div", { class: "perf-row__actions" }, [save, toggleReplacement, remove]),
+      ]),
+    ]),
   ]);
 }
 
@@ -556,8 +722,9 @@ function createPerfAddForm(hall) {
   const start = dateTimeInput(times.start, "Начало нового сета", "perf-start");
   const end = dateTimeInput(times.end, "Конец нового сета", "perf-end");
   const submit = el("button", { class: "btn btn--primary btn--sm", type: "submit", text: "+ Сет" });
+  const spacer = el("span", { class: "perf-add__spacer", attrs: { "aria-hidden": "true" } });
 
-  const form = el("form", { class: "perf-add", novalidate: true }, [name, start, end, submit]);
+  const form = el("form", { class: "perf-add", novalidate: true }, [spacer, name, start, end, submit]);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const performer = name.value.trim();
@@ -692,6 +859,7 @@ function renderHalls() {
   clear(hallsHost);
   const canEdit = Boolean(current);
 
+  updateSwapBar();
   addHallForm.hidden = !canEdit;
   $("halls-count").textContent = current
     ? `${current.halls.length} ${plural(current.halls.length, "зал", "зала", "залов")}`
@@ -718,6 +886,7 @@ function renderHalls() {
 
 async function openEvent(id) {
   const data = await request(`/api/admin/events/${id}`);
+  selectedPerfIds.clear();
   current = data.event;
   timezones = data.timezones || timezones;
   fillTimezoneSelect(current.timezone);
@@ -730,6 +899,7 @@ async function openEvent(id) {
 
 function newEvent() {
   current = null;
+  selectedPerfIds.clear();
   eventForm.reset();
   const tz = "Europe/Moscow";
   fillTimezoneSelect(tz);
@@ -1261,6 +1431,7 @@ const AUDIT_LABELS = {
   "hall.delete": "Удалил зал",
   "performance.create": "Добавил артиста",
   "performance.update": "Изменил артиста",
+  "performance.swap": "Поменял артистов местами",
   "performance.delete": "Удалил артиста",
   "performer.delete": "Удалил артиста из подсказок",
   "site.links": "Изменил кнопки в подвале",
@@ -1436,6 +1607,13 @@ $("performers-back").addEventListener("click", () => {
 });
 eventForm.addEventListener("submit", saveEvent);
 $("delete-event").addEventListener("click", deleteCurrentEvent);
+$("swap-apply").addEventListener("click", () => {
+  swapPerformances();
+});
+$("swap-clear").addEventListener("click", () => {
+  selectedPerfIds.clear();
+  renderHalls();
+});
 
 addHallForm.addEventListener("submit", async (event) => {
   event.preventDefault();

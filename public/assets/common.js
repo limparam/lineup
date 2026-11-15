@@ -546,13 +546,25 @@ export function renderEvent(host, event, { title } = {}) {
       const elapsed = el("span", { class: "slot__elapsed" });
       const left = el("span", { class: "slot__left" });
 
-      const node = el("li", { class: "slot" }, [
+      const headChildren = [
+        el("span", {
+          class: "slot__name",
+          text: perf.displayPerformer || perf.performer,
+        }),
+      ];
+      if (perf.isReplacement) {
+        headChildren.push(
+          el("span", { class: "slot__replacement", text: "замена" }),
+        );
+      }
+      headChildren.push(el("span", { class: "slot__badge", text: "live" }));
+
+      const node = el("li", {
+        class: "slot" + (perf.isReplacement ? " slot--replacement" : ""),
+      }, [
         el("div", { class: "slot__time" }, timeChildren),
         el("div", { class: "slot__main" }, [
-          el("div", { class: "slot__head" }, [
-            el("span", { class: "slot__name", text: perf.performer }),
-            el("span", { class: "slot__badge", text: "live" }),
-          ]),
+          el("div", { class: "slot__head" }, headChildren),
           el("div", { class: "slot__progress" }, [bar]),
           el("div", { class: "slot__meta" }, [elapsed, left]),
         ]),

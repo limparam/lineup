@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=14">
+  <link rel="stylesheet" href="/assets/style.css?v=16">
 </head>
 <body>
   <header class="adminbar">
@@ -195,6 +195,20 @@
             <span class="muted small" id="halls-count"></span>
           </div>
 
+          <div class="swap-bar" id="swap-bar" hidden>
+            <div class="swap-bar__info">
+              <span class="swap-bar__label">Поменять местами</span>
+              <strong id="swap-text"></strong>
+            </div>
+            <span class="spacer"></span>
+            <button class="btn btn--primary btn--sm" id="swap-apply" type="button">
+              Поменять
+            </button>
+            <button class="btn btn--ghost btn--sm" id="swap-clear" type="button">
+              Сбросить
+            </button>
+          </div>
+
           <div id="halls"></div>
 
           <form class="add-hall" id="add-hall-form" novalidate>
@@ -205,7 +219,10 @@
 
           <p class="field__hint mt-md">
             У каждого сета обязательны начало и конец. Пересечения по времени
-            внутри одного зала не допускаются.
+            внутри одного зала не допускаются. Галочки слева от имени выбирают
+            два сета — кнопка «Поменять» обменяет артистов, сохранив время.
+            Кнопка «Замена» отмечает слот, где артист не приехал: на сайте
+            будет написано «Замена», а имя не попадёт в список артистов.
           </p>
         </div>
       </div>
@@ -413,6 +430,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=14"></script>
+  <script type="module" src="/assets/admin.js?v=16"></script>
 </body>
 </html>

@@ -6,7 +6,7 @@ import {
   renderEvent,
   setServerNow,
   startClock,
-} from "./common.js?v=14";
+} from "./common.js?v=16";
 
 const host = document.getElementById("event");
 const slug = decodeURIComponent(

@@ -69,11 +69,13 @@ CREATE TABLE IF NOT EXISTS halls (
 );
 
 CREATE TABLE IF NOT EXISTS performances (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    hall_id    INTEGER NOT NULL REFERENCES halls(id) ON DELETE CASCADE,
-    performer  TEXT NOT NULL,
-    starts_at  TEXT NOT NULL,
-    ends_at    TEXT NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    hall_id        INTEGER NOT NULL REFERENCES halls(id) ON DELETE CASCADE,
+    performer      TEXT NOT NULL,
+    starts_at      TEXT NOT NULL,
+    ends_at        TEXT NOT NULL,
+    -- 1 = слот отдан замене: имя не публикуется и не попадает в базу артистов.
+    is_replacement INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS performers (
@@ -205,6 +207,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "UPDATE events SET owner_id = ? WHERE owner_id IS NULL", (owner["id"],)
         )
 
+    # Слоты с заменой: имя артиста не публикуется и не попадает в подсказки.
+    perf_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(performances)")}
+    if "is_replacement" not in perf_columns:
+        conn.execute(
+            "ALTER TABLE performances ADD COLUMN "
+            "is_replacement INTEGER NOT NULL DEFAULT 0"
+        )
+
     # База исполнителей: сохраняем имена из уже существующих выступлений,
     # чтобы автозаполнение работало и после удаления старых сетов.
     conn.execute(
@@ -214,6 +225,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "JOIN halls h ON h.id = p.hall_id "
         "JOIN events e ON e.id = h.event_id "
         "WHERE TRIM(p.performer) <> '' AND e.owner_id IS NOT NULL "
+        "AND p.is_replacement = 0 "
         "GROUP BY e.owner_id, TRIM(p.performer) COLLATE NOCASE"
     )
 
