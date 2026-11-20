@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=16">
+  <link rel="stylesheet" href="/assets/style.css?v=18">
 </head>
 <body>
   <header class="adminbar">
@@ -183,6 +183,7 @@
 
             <div class="form-actions">
               <button class="btn btn--primary" id="save-event" type="submit">Сохранить</button>
+              <button class="btn" id="shift-event" type="button" hidden>Перенести время</button>
               <span class="spacer"></span>
               <button class="btn btn--danger" id="delete-event" type="button" hidden>Удалить</button>
             </div>
@@ -221,8 +222,14 @@
             У каждого сета обязательны начало и конец. Пересечения по времени
             внутри одного зала не допускаются. Галочки слева от имени выбирают
             два сета — кнопка «Поменять» обменяет артистов, сохранив время.
-            Кнопка «Замена» отмечает слот, где артист не приехал: на сайте
-            будет написано «Замена», а имя не попадёт в список артистов.
+            Кнопка «Замена» отмечает слот, где артист не приехал. Укажите в
+            освободившемся поле, кто заменяет, — имя появится на сайте с
+            пометкой «замена». Пустое поле означает, что замена ещё не найдена.
+            Для совместных сетов пишите имена через тег в скобках:
+            <code>(VS)</code>, <code>(B2B)</code>, <code>(F2F)</code>,
+            <code>(&amp;)</code> или <code>(AND)</code> — например,
+            <code>NOVA (B2B) ZVUK</code>. На сайте участники разделятся на
+            отдельных артистов, а скобки в расписании исчезнут.
           </p>
         </div>
       </div>
@@ -382,6 +389,27 @@
       </div>
     </section>
 
+  <dialog id="shift-dialog">
+    <h2>Перенести мероприятие</h2>
+    <p class="auth__sub">
+      Сеты сдвинутся на тот же интервал: порядок и длительность сохранятся.
+    </p>
+    <form id="shift-form" class="stack" novalidate>
+      <div class="field">
+        <label for="shift-starts">Новое начало</label>
+        <input id="shift-starts" type="text" class="dt-input" inputmode="numeric"
+               autocomplete="off" spellcheck="false" maxlength="16"
+               placeholder="ДД.ММ.ГГГГ ЧЧ:ММ" required>
+        <span class="field__hint" id="shift-hint"></span>
+      </div>
+      <p class="form-error" id="shift-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="btn btn--ghost" id="shift-cancel" type="button">Отмена</button>
+        <button class="btn btn--primary" type="submit">Перенести</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="account-dialog">
     <h2>Сменить пароль</h2>
     <p class="auth__sub">Не короче 10 символов. Остальные сессии будут завершены.</p>
@@ -430,6 +458,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=16"></script>
+  <script type="module" src="/assets/admin.js?v=18"></script>
 </body>
 </html>

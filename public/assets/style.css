@@ -1386,6 +1386,16 @@ ol {
   line-height: 1.45;
 }
 
+.field__hint code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
 .field-row {
   display: grid;
   gap: 14px;
@@ -1720,17 +1730,6 @@ input[type="datetime-local"] {
 
 .perf-name-cell input {
   width: 100%;
-}
-
-.perf-replacement {
-  display: inline-block;
-  padding: 7px 10px;
-  border: 1px solid rgba(255, 191, 92, 0.42);
-  border-radius: 8px;
-  background: rgba(255, 191, 92, 0.1);
-  color: #ffce85;
-  font-size: 0.83rem;
-  font-weight: 800;
 }
 
 .perf-replacement__note {

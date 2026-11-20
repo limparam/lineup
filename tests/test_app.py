@@ -532,6 +532,115 @@ class LineUPTestCase(unittest.TestCase):
         status, _, data = self.client.get("/api/admin/performers")
         self.assertIn("DJ Vik", data["performers"])
 
+    def test_replacement_can_name_the_new_artist(self):
+        event = self.create_event(title="REPLACEMENT NAME")
+        hall = self.add_hall(event["id"])
+        perf = self.add_perf(
+            hall["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00"
+        )["performance"]
+
+        status, _, data = self.client.patch(
+            f"/api/admin/performances/{perf['id']}",
+            {
+                "isReplacement": True,
+                "replacementPerformer": "DJ Nova",
+                "startsAt": "2027-11-04T20:00",
+                "endsAt": "2027-11-04T21:00",
+            },
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        updated = data["performance"]
+        self.assertEqual(updated["performer"], "DJ Vik")
+        self.assertEqual(updated["replacementPerformer"], "DJ Nova")
+        self.assertEqual(updated["displayPerformer"], "DJ Nova")
+        self.assertTrue(updated["isReplacement"])
+
+        status, _, data = self.client.get(f"/api/public/events/{event['slug']}")
+        self.assertEqual(status, 200, data)
+        public_perf = data["event"]["halls"][0]["performances"][0]
+        self.assertEqual(public_perf["displayPerformer"], "DJ Nova")
+        self.assertEqual(public_perf["replacementPerformer"], "DJ Nova")
+        self.assertTrue(public_perf["isReplacement"])
+
+        status, _, data = self.client.get("/api/public/artists")
+        names = [item["name"] for item in data["artists"]]
+        self.assertIn("DJ Nova", names)
+        self.assertNotIn("DJ Vik", names)
+
+        status, _, data = self.client.get("/api/admin/performers")
+        self.assertIn("DJ Nova", data["performers"])
+        self.assertNotIn("DJ Vik", data["performers"])
+
+        # Пустое имя: замена ещё не найдена, публично показываем «Замена».
+        status, _, data = self.client.patch(
+            f"/api/admin/performances/{perf['id']}",
+            {
+                "isReplacement": True,
+                "replacementPerformer": "",
+                "startsAt": "2027-11-04T20:00",
+                "endsAt": "2027-11-04T21:00",
+            },
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["performance"]["displayPerformer"], "Замена")
+        self.assertEqual(data["performance"]["replacementPerformer"], "")
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertNotIn("DJ Nova", [item["name"] for item in data["artists"]])
+
+        # Возврат артиста очищает замену и возвращает исходное имя.
+        status, _, data = self.client.patch(
+            f"/api/admin/performances/{perf['id']}",
+            {
+                "isReplacement": False,
+                "startsAt": "2027-11-04T20:00",
+                "endsAt": "2027-11-04T21:00",
+            },
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["performance"]["displayPerformer"], "DJ Vik")
+        self.assertEqual(data["performance"]["replacementPerformer"], "")
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertIn("DJ Vik", [item["name"] for item in data["artists"]])
+
+    def test_swap_moves_replacement_state_and_name(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        first = self.add_perf(
+            hall["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00"
+        )["performance"]
+        second = self.add_perf(
+            hall["id"], "DJ Rob", "2027-11-04T21:00", "2027-11-04T22:00"
+        )["performance"]
+
+        status, _, data = self.client.patch(
+            f"/api/admin/performances/{first['id']}",
+            {
+                "isReplacement": True,
+                "replacementPerformer": "DJ Nova",
+                "startsAt": "2027-11-04T20:00",
+                "endsAt": "2027-11-04T21:00",
+            },
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+
+        status, _, data = self.client.post(
+            "/api/admin/performances/swap",
+            {"firstId": first["id"], "secondId": second["id"]},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        by_id = {item["id"]: item for item in data["performances"]}
+        self.assertEqual(by_id[first["id"]]["performer"], "DJ Rob")
+        self.assertFalse(by_id[first["id"]]["isReplacement"])
+        self.assertEqual(by_id[first["id"]]["replacementPerformer"], "")
+        self.assertEqual(by_id[second["id"]]["performer"], "DJ Vik")
+        self.assertTrue(by_id[second["id"]]["isReplacement"])
+        self.assertEqual(by_id[second["id"]]["replacementPerformer"], "DJ Nova")
+
     def test_foreign_admin_cannot_swap_or_replace(self):
         event = self.create_event()
         hall = self.add_hall(event["id"])
@@ -555,6 +664,113 @@ class LineUPTestCase(unittest.TestCase):
         status, _, data = client.patch(
             f"/api/admin/performances/{first['id']}",
             {"isReplacement": True},
+            csrf=client.csrf,
+        )
+        self.assertEqual(status, 404, data)
+
+    def test_shift_moves_event_and_all_sets(self):
+        event = self.create_event()
+        hall1 = self.add_hall(event["id"], "Зал 1")
+        hall2 = self.add_hall(event["id"], "Зал 2")
+        first = self.add_perf(
+            hall1["id"], "DJ Vik", "2027-11-04T20:00", "2027-11-04T21:00"
+        )["performance"]
+        second = self.add_perf(
+            hall1["id"], "DJ Rob", "2027-11-04T21:00", "2027-11-04T22:00"
+        )["performance"]
+        third = self.add_perf(
+            hall2["id"], "DJ Smash", "2027-11-04T20:00", "2027-11-04T22:00"
+        )["performance"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/shift",
+            {"startsAt": "2027-11-11T22:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        shifted = data["event"]
+        self.assertEqual(data["shiftedPerformances"], 3)
+        self.assertEqual(shifted["startsAt"], "2027-11-11T19:00:00Z")
+        self.assertEqual(shifted["endsAt"], "2027-11-12T05:00:00Z")
+        self.assertEqual(shifted["startsAtLocal"], "2027-11-11T22:00")
+        self.assertEqual(shifted["endsAtLocal"], "2027-11-12T08:00")
+
+        rows = {
+            row["id"]: row
+            for hall in shifted["halls"]
+            for row in hall["performances"]
+        }
+        # Порядок и длительность сохранились, время сдвинулось на 7 дней 2 часа.
+        self.assertEqual(rows[first["id"]]["startsAtLocal"], "2027-11-11T22:00")
+        self.assertEqual(rows[first["id"]]["endsAtLocal"], "2027-11-11T23:00")
+        self.assertEqual(rows[second["id"]]["startsAtLocal"], "2027-11-11T23:00")
+        self.assertEqual(rows[second["id"]]["endsAtLocal"], "2027-11-12T00:00")
+        self.assertEqual(rows[third["id"]]["startsAtLocal"], "2027-11-11T22:00")
+        self.assertEqual(rows[third["id"]]["endsAtLocal"], "2027-11-12T00:00")
+        self.assertEqual(rows[first["id"]]["performer"], "DJ Vik")
+        self.assertEqual(rows[second["id"]]["performer"], "DJ Rob")
+
+        status, _, log = self.client.get("/api/admin/audit")
+        self.assertEqual(status, 200, log)
+        self.assertEqual(log["entries"][0]["action"], "event.shift")
+        self.assertIn("04.11.2027 20:00", log["entries"][0]["detail"])
+        self.assertIn("11.11.2027 22:00", log["entries"][0]["detail"])
+
+        status, _, public = self.client.get("/api/public/events/dnb-night")
+        self.assertEqual(status, 200, public)
+        self.assertEqual(public["event"]["startsAt"], "2027-11-11T19:00:00Z")
+
+    def test_shift_keeps_relative_schedule_inside_new_bounds(self):
+        event = self.create_event()
+        hall = self.add_hall(event["id"])
+        self.add_perf(hall["id"], "Early", "2027-11-04T20:00", "2027-11-04T21:00")
+        self.add_perf(hall["id"], "Late", "2027-11-05T05:00", "2027-11-05T05:45")
+
+        # Сдвиг на сутки назад: сеты остаются внутри нового интервала.
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/shift",
+            {"startsAt": "2027-11-03T20:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        rows = data["event"]["halls"][0]["performances"]
+        self.assertEqual(
+            [(row["startsAtLocal"], row["endsAtLocal"]) for row in rows],
+            [("2027-11-03T20:00", "2027-11-03T21:00"),
+             ("2027-11-04T05:00", "2027-11-04T05:45")],
+        )
+
+    def test_shift_validation(self):
+        event = self.create_event()
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/shift",
+            {"startsAt": "2027-11-04T20:00"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400, data)
+        self.assertIn("совпадает", data["error"]["message"])
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/shift",
+            {"startsAt": "завтра"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400, data)
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/shift",
+            {}, csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400, data)
+        self.assertIn("Укажите новое время", data["error"]["message"])
+
+    def test_shift_is_scoped_to_owner(self):
+        event = self.create_event()
+        self.create_admin()
+        client = self.login_as("helper", "helper-password-1")
+        status, _, data = client.post(
+            f"/api/admin/events/{event['id']}/shift",
+            {"startsAt": "2027-12-01T20:00"},
             csrf=client.csrf,
         )
         self.assertEqual(status, 404, data)
@@ -793,6 +1009,107 @@ class LineUPTestCase(unittest.TestCase):
         self.assertNotIn("Secret DJ", [a["name"] for a in data["artists"]])
         status, _, data = self.client.get("/api/public/artists?q=secret")
         self.assertEqual(data["artists"], [])
+
+    def test_artist_collaborations_split_into_separate_artists(self):
+        event = self.create_event(title="B2B NIGHT")
+        hall = self.add_hall(event["id"])
+        self.add_perf(
+            hall["id"], "ZVUK (B2B) RAZNOS",
+            "2027-11-04T20:00", "2027-11-04T21:00")
+        self.add_perf(
+            hall["id"], "LUMEN (vs) MIRA",
+            "2027-11-04T21:00", "2027-11-04T22:00")
+        self.add_perf(
+            hall["id"], "KIRA (f2f) NORD",
+            "2027-11-04T22:00", "2027-11-04T23:00")
+        self.add_perf(
+            hall["id"], "DJ (Live)",
+            "2027-11-04T23:00", "2027-11-05T00:00")
+
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertEqual(status, 200, data)
+        artists = {item["name"]: item for item in data["artists"]}
+        for name in ("ZVUK", "RAZNOS", "LUMEN", "MIRA", "KIRA", "NORD"):
+            self.assertIn(name, artists)
+        self.assertIn("DJ (Live)", artists)
+        for collaboration in ("ZVUK (B2B) RAZNOS", "LUMEN (vs) MIRA",
+                              "KIRA (f2f) NORD"):
+            self.assertNotIn(collaboration, artists)
+
+        # У каждого участника совместного сета — то же мероприятие и время.
+        self.assertEqual(artists["ZVUK"]["eventCount"], 1)
+        self.assertEqual(artists["ZVUK"]["events"][0]["title"], "B2B NIGHT")
+        self.assertEqual(artists["ZVUK"]["events"][0]["sets"][0]["hall"], "Зал 1")
+        self.assertEqual(artists["RAZNOS"]["events"][0]["sets"],
+                         artists["ZVUK"]["events"][0]["sets"])
+
+        # В расписании маркеры показываются без скобок и в верхнем регистре,
+        # а сохранённое имя остаётся как ввёл организатор.
+        status, _, data = self.client.get(f"/api/public/events/{event['slug']}")
+        self.assertEqual(status, 200, data)
+        performances = data["event"]["halls"][0]["performances"]
+        self.assertEqual(
+            [item["displayPerformer"] for item in performances],
+            ["ZVUK B2B RAZNOS", "LUMEN VS MIRA", "KIRA F2F NORD", "DJ (Live)"],
+        )
+        self.assertEqual(performances[0]["performer"], "ZVUK (B2B) RAZNOS")
+        self.assertEqual(performances[1]["performer"], "LUMEN (vs) MIRA")
+
+        status, _, data = self.client.get("/api/public/artists?q=raznos")
+        self.assertEqual([item["name"] for item in data["artists"]],
+                         ["RAZNOS"])
+        status, _, data = self.client.get("/api/public/artists?q=lumen")
+        self.assertEqual([item["name"] for item in data["artists"]],
+                         ["LUMEN"])
+
+    def test_artist_collaboration_ampersand_and_and(self):
+        event = self.create_event(title="AND NIGHT")
+        hall = self.add_hall(event["id"])
+        self.add_perf(
+            hall["id"], "SOL (&) VERA",
+            "2027-11-04T20:00", "2027-11-04T21:00")
+        self.add_perf(
+            hall["id"], "RIFT (and) NOVA",
+            "2027-11-04T21:00", "2027-11-04T22:00")
+
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertEqual(status, 200, data)
+        self.assertEqual([item["name"] for item in data["artists"]],
+                         ["NOVA", "RIFT", "SOL", "VERA"])
+
+        status, _, data = self.client.get(f"/api/public/events/{event['slug']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(
+            [item["displayPerformer"]
+             for item in data["event"]["halls"][0]["performances"]],
+            ["SOL & VERA", "RIFT AND NOVA"],
+        )
+
+    def test_artist_split_ignores_unknown_parentheses(self):
+        event = self.create_event(title="MIXED NIGHT")
+        hall = self.add_hall(event["id"])
+        self.add_perf(
+            hall["id"], "ASTER (Backstage) SOL",
+            "2027-11-04T20:00", "2027-11-04T21:00")
+        self.add_perf(
+            hall["id"], "MIRA (B2B) NORD (F2F) VERA",
+            "2027-11-04T21:00", "2027-11-04T22:00")
+
+        status, _, data = self.client.get("/api/public/artists")
+        self.assertEqual(status, 200, data)
+        names = [item["name"] for item in data["artists"]]
+        self.assertIn("ASTER (Backstage) SOL", names)
+        self.assertNotIn("ASTER", names)
+        for name in ("MIRA", "NORD", "VERA"):
+            self.assertIn(name, names)
+
+        status, _, data = self.client.get(f"/api/public/events/{event['slug']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(
+            [item["displayPerformer"]
+             for item in data["event"]["halls"][0]["performances"]],
+            ["ASTER (Backstage) SOL", "MIRA B2B NORD F2F VERA"],
+        )
 
     def test_artists_hide_times_for_filtered_sets(self):
         now = timeutil.now_utc().replace(second=0, microsecond=0)

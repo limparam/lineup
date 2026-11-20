@@ -546,13 +546,14 @@ export function renderEvent(host, event, { title } = {}) {
       const elapsed = el("span", { class: "slot__elapsed" });
       const left = el("span", { class: "slot__left" });
 
+      const replacementName = (perf.replacementPerformer || "").trim();
       const headChildren = [
         el("span", {
           class: "slot__name",
           text: perf.displayPerformer || perf.performer,
         }),
       ];
-      if (perf.isReplacement) {
+      if (perf.isReplacement && replacementName) {
         headChildren.push(
           el("span", { class: "slot__replacement", text: "замена" }),
         );

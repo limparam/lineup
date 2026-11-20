@@ -7,7 +7,7 @@ import {
   plural,
   setServerNow,
   timeStr,
-} from "./common.js?v=16";
+} from "./common.js?v=17";
 
 const host = document.getElementById("artists");
 const input = document.getElementById("artist-search");

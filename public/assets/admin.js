@@ -5,7 +5,7 @@ import {
   eventStatus,
   formatRangeShort,
   plural,
-} from "./common.js?v=16";
+} from "./common.js?v=17";
 
 const $ = (id) => document.getElementById(id);
 
@@ -36,6 +36,8 @@ const addUserError = $("add-user-error");
 const userDialog = $("user-dialog");
 const userPasswordForm = $("user-password-form");
 const userPasswordError = $("user-password-error");
+const shiftDialog = $("shift-dialog");
+const shiftForm = $("shift-form");
 
 let csrf = null;
 let username = "";
@@ -433,6 +435,7 @@ function fillEventForm() {
   }
   $("event-sub").textContent = subParts.filter(Boolean).join(" · ");
   $("delete-event").hidden = false;
+  $("shift-event").hidden = false;
 
   const publicLink = $("open-public");
   publicLink.hidden = !current.published || current.publiclyVisible === false;
@@ -455,9 +458,11 @@ function nextSlotTimes(hall) {
 }
 
 function performanceLabel(performance) {
-  return performance && performance.isReplacement
-    ? "Замена"
-    : (performance && performance.performer) || "";
+  if (!performance) return "";
+  if (performance.isReplacement) {
+    return (performance.replacementPerformer || "").trim() || "Замена";
+  }
+  return performance.performer || "";
 }
 
 function findPerformance(id) {
@@ -539,9 +544,17 @@ function performanceRow(hall, performance) {
     type: "text",
     class: "perf-name",
     maxlength: "120",
-    value: performance.performer,
-    placeholder: "Имя исполнителя",
-    attrs: { "aria-label": "Исполнитель" },
+    value: performance.isReplacement
+      ? performance.replacementPerformer || ""
+      : performance.performer,
+    placeholder: performance.isReplacement
+      ? "Кто заменяет? Пока не найден"
+      : "Имя исполнителя",
+    attrs: {
+      "aria-label": performance.isReplacement
+        ? "Кто заменяет артиста"
+        : "Исполнитель",
+    },
   });
   const startInput = dateTimeInput(
     performance.startsAtLocal,
@@ -569,17 +582,14 @@ function performanceRow(hall, performance) {
     }
   });
 
-  const nameCell = el("div", { class: "perf-name-cell" });
+  const nameCell = el("div", { class: "perf-name-cell" }, [nameInput]);
   if (performance.isReplacement) {
     nameCell.append(
-      el("span", { class: "perf-replacement", text: "Замена" }),
       el("span", {
         class: "perf-replacement__note",
-        text: "артист не приехал — имя скрыто",
+        text: `Замена · вместо ${performance.performer || "—"}`,
       }),
     );
-  } else {
-    nameCell.append(nameInput);
   }
 
   const save = el("button", {
@@ -600,6 +610,7 @@ function performanceRow(hall, performance) {
       const body = { startsAt, endsAt };
       if (performance.isReplacement) {
         body.isReplacement = true;
+        body.replacementPerformer = nameInput.value.trim();
       } else {
         const performer = nameInput.value.trim();
         if (!performer) {
@@ -637,8 +648,8 @@ function performanceRow(hall, performance) {
         ? "Вернуть артиста в сет"
         : "Отметить замену",
       title: performance.isReplacement
-        ? "Вернуть артиста в сет"
-        : "Артист не приехал — показать «Замена»",
+        ? "Вернуть исходного артиста в сет"
+        : "Артист не приехал — отметить замену",
     },
     onClick: async () => {
       const startsAt = displayToLocal(startInput.value);
@@ -647,15 +658,24 @@ function performanceRow(hall, performance) {
         toast("Дата и время сета: ДД.ММ.ГГГГ ЧЧ:ММ", "error");
         return;
       }
+      const body = {
+        isReplacement: !performance.isReplacement,
+        startsAt,
+        endsAt,
+      };
+      if (performance.isReplacement) {
+        body.replacementPerformer = "";
+      } else {
+        // Если админ уже ввёл имя в поле, считаем его именем замены.
+        const typed = nameInput.value.trim();
+        const original = (performance.performer || "").trim();
+        body.replacementPerformer = typed && typed !== original ? typed : "";
+      }
       setBusy(toggleReplacement, true);
       try {
         const data = await request(`/api/admin/performances/${performance.id}`, {
           method: "PATCH",
-          body: {
-            isReplacement: !performance.isReplacement,
-            startsAt,
-            endsAt,
-          },
+          body,
         });
         const index = hall.performances.findIndex((p) => p.id === performance.id);
         hall.performances[index] = data.performance;
@@ -663,7 +683,7 @@ function performanceRow(hall, performance) {
         loadPerformers();
         toast(
           data.performance.isReplacement
-            ? "Отмечена замена: имя скрыто из списка артистов"
+            ? "Отмечена замена: укажите, кто заменяет"
             : "Артист возвращён в сет",
         );
       } catch (error) {
@@ -919,6 +939,7 @@ function newEvent() {
   $("event-title").textContent = "Новое мероприятие";
   $("event-sub").textContent = "Заполните данные и сохраните — затем добавьте залы.";
   $("delete-event").hidden = true;
+  $("shift-event").hidden = true;
   $("open-public").hidden = true;
   renderHalls();
   showView("event");
@@ -993,6 +1014,109 @@ async function deleteCurrentEvent() {
     await openList();
   } catch (error) {
     toast(error.message, "error");
+  }
+}
+
+/* ------------------------------------------------------ перенос времени */
+
+function localStamp(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(
+    String(value || ""),
+  );
+  if (!match) return NaN;
+  return Date.UTC(
+    Number(match[1]), Number(match[2]) - 1, Number(match[3]),
+    Number(match[4]), Number(match[5]),
+  );
+}
+
+function humanShift(minutes) {
+  const sign = minutes > 0 ? "+" : "−";
+  let rest = Math.abs(minutes);
+  const days = Math.floor(rest / 1440);
+  rest -= days * 1440;
+  const hours = Math.floor(rest / 60);
+  const mins = rest - hours * 60;
+  const parts = [];
+  if (days) parts.push(`${days} ${plural(days, "день", "дня", "дней")}`);
+  if (hours) parts.push(`${hours} ч`);
+  if (mins) parts.push(`${mins} мин`);
+  return `${sign}${parts.join(" ") || "0 мин"}`;
+}
+
+function updateShiftHint() {
+  const hint = $("shift-hint");
+  if (!current) {
+    hint.textContent = "";
+    return;
+  }
+  const count = current.halls.reduce(
+    (sum, hall) => sum + hall.performances.length, 0);
+  const base = `Сейчас: ${formatRangeShort(current.startsAt, current.endsAt, current.timezone)}`;
+  const sets = count
+    ? ` · ${count} ${plural(count, "сет", "сета", "сетов")}`
+    : " · сетов пока нет";
+  const value = displayToLocal($("shift-starts").value);
+  if (!value) {
+    hint.textContent = base + sets;
+    return;
+  }
+  const minutes = Math.round(
+    (localStamp(value) - localStamp(current.startsAtLocal)) / 60000);
+  if (!minutes) {
+    hint.textContent = `${base}${sets} · время не изменилось`;
+    return;
+  }
+  const newEnd = addMinutesLocal(current.endsAtLocal, minutes);
+  hint.textContent =
+    `${base}${sets} · сдвиг ${humanShift(minutes)}` +
+    `, конец станет ${localToDisplay(newEnd)}`;
+}
+
+function openShiftDialog() {
+  if (!current) return;
+  $("shift-starts").value = localToDisplay(current.startsAtLocal);
+  $("shift-error").hidden = true;
+  updateShiftHint();
+  shiftDialog.showModal();
+  $("shift-starts").focus();
+}
+
+async function submitShift(event) {
+  event.preventDefault();
+  if (!current) return;
+  const errorBox = $("shift-error");
+  errorBox.hidden = true;
+  const startsAt = displayToLocal($("shift-starts").value);
+  if (!startsAt) {
+    errorBox.textContent = "Укажите начало в формате ДД.ММ.ГГГГ ЧЧ:ММ";
+    errorBox.hidden = false;
+    return;
+  }
+  const button = shiftForm.querySelector('button[type="submit"]');
+  setBusy(button, true);
+  try {
+    const data = await request(`/api/admin/events/${current.id}/shift`, {
+      method: "POST",
+      body: { startsAt },
+    });
+    current = data.event;
+    selectedPerfIds.clear();
+    fillTimezoneSelect(current.timezone);
+    fillEventForm();
+    renderHalls();
+    shiftDialog.close();
+    const shifted = data.shiftedPerformances || 0;
+    toast(
+      shifted
+        ? `Мероприятие перенесено, сдвинуто ${shifted} ${plural(shifted, "сет", "сета", "сетов")}`
+        : "Мероприятие перенесено",
+    );
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+  } finally {
+    setBusy(button, false);
   }
 }
 
@@ -1425,6 +1549,7 @@ async function openSite() {
 const AUDIT_LABELS = {
   "event.create": "Создал мероприятие",
   "event.update": "Изменил мероприятие",
+  "event.shift": "Перенёс мероприятие",
   "event.delete": "Удалил мероприятие",
   "hall.create": "Добавил зал",
   "hall.update": "Переименовал зал",
@@ -1607,6 +1732,14 @@ $("performers-back").addEventListener("click", () => {
 });
 eventForm.addEventListener("submit", saveEvent);
 $("delete-event").addEventListener("click", deleteCurrentEvent);
+$("shift-event").addEventListener("click", openShiftDialog);
+$("shift-cancel").addEventListener("click", () => shiftDialog.close());
+shiftForm.addEventListener("submit", submitShift);
+$("shift-starts").addEventListener("input", updateShiftHint);
+$("shift-starts").addEventListener("blur", () => {
+  normalizeDateTimeField($("shift-starts"));
+  updateShiftHint();
+});
 $("swap-apply").addEventListener("click", () => {
   swapPerformances();
 });

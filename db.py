@@ -74,8 +74,10 @@ CREATE TABLE IF NOT EXISTS performances (
     performer      TEXT NOT NULL,
     starts_at      TEXT NOT NULL,
     ends_at        TEXT NOT NULL,
-    -- 1 = слот отдан замене: имя не публикуется и не попадает в базу артистов.
-    is_replacement INTEGER NOT NULL DEFAULT 0
+    -- 1 = слот отдан замене: исходное имя не публикуется, вместо него
+    -- показывается replacement_performer (если замена уже найдена).
+    is_replacement INTEGER NOT NULL DEFAULT 0,
+    replacement_performer TEXT
 );
 
 CREATE TABLE IF NOT EXISTS performers (
@@ -214,6 +216,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE performances ADD COLUMN "
             "is_replacement INTEGER NOT NULL DEFAULT 0"
+        )
+    if "replacement_performer" not in perf_columns:
+        conn.execute(
+            "ALTER TABLE performances ADD COLUMN replacement_performer TEXT"
         )
 
     # База исполнителей: сохраняем имена из уже существующих выступлений,
