@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=18">
+  <link rel="stylesheet" href="/assets/style.css?v=19">
 </head>
 <body>
   <header class="adminbar">
@@ -74,9 +74,17 @@
           <h1 class="admin-title" id="event-title">Мероприятие</h1>
           <p class="admin-sub" id="event-sub"></p>
         </div>
-        <a class="btn btn--ghost btn--sm" id="open-public" href="/" target="_blank" rel="noopener">
-          Открыть на сайте ↗
-        </a>
+        <div class="admin-head__side">
+          <button class="btn btn--ghost btn--sm" id="copy-event-link" type="button" hidden>
+            Скопировать ссылку
+          </button>
+          <button class="btn btn--ghost btn--sm" id="download-qr" type="button" hidden>
+            Скачать QR
+          </button>
+          <a class="btn btn--ghost btn--sm" id="open-public" href="/" target="_blank" rel="noopener">
+            Открыть на сайте ↗
+          </a>
+        </div>
       </div>
 
       <div class="admin-grid">
@@ -458,6 +466,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=18"></script>
+  <script type="module" src="/assets/admin.js?v=19"></script>
 </body>
 </html>

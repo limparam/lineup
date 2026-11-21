@@ -668,6 +668,9 @@ class LineUPTestCase(unittest.TestCase):
         )
         self.assertEqual(status, 404, data)
 
+        status, _, _ = client.get(f"/api/admin/events/{event['id']}/qr.png")
+        self.assertEqual(status, 404)
+
     def test_shift_moves_event_and_all_sets(self):
         event = self.create_event()
         hall1 = self.add_hall(event["id"], "Зал 1")
@@ -835,6 +838,44 @@ class LineUPTestCase(unittest.TestCase):
                 conn.execute("SELECT COUNT(*) FROM performances").fetchone()[0], 0)
         finally:
             conn.close()
+
+    def test_event_qr_is_generated_on_demand(self):
+        event = self.create_event(title="QR NIGHT")
+        status, headers, _ = self.client.get(
+            f"/api/admin/events/{event['id']}/qr.png")
+        self.assertEqual(status, 200)
+        self.assertIn("image/png", headers["content-type"])
+        self.assertIn(f"lineup-{event['slug']}-qr.png",
+                      headers["content-disposition"])
+        self.assertIn("no-store", headers["cache-control"])
+        self.assertTrue(self.client.last_body.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(self.client.last_body), 500)
+
+        # Черновик: публичной страницы нет, QR не отдаём.
+        draft = self.create_event(title="QR DRAFT", published=False)
+        status, _, _ = self.client.get(
+            f"/api/admin/events/{draft['id']}/qr.png")
+        self.assertEqual(status, 404)
+
+        # Прошедшее мероприятие: QR больше не доступен.
+        now = timeutil.now_utc()
+        tz = "Europe/Moscow"
+        past = self.create_event(
+            title="QR PAST",
+            startsAt=timeutil.to_local_input(now - timedelta(hours=3), tz),
+            endsAt=timeutil.to_local_input(now - timedelta(hours=2), tz),
+        )
+        status, _, _ = self.client.get(
+            f"/api/admin/events/{past['id']}/qr.png")
+        self.assertEqual(status, 404)
+
+        # После удаления мероприятия QR тоже исчезает.
+        status, _, _ = self.client.delete(
+            f"/api/admin/events/{event['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        status, _, _ = self.client.get(
+            f"/api/admin/events/{event['id']}/qr.png")
+        self.assertEqual(status, 404)
 
     def test_admin_event_payload_has_local_times(self):
         event = self.create_event()

@@ -3,3 +3,4 @@
 # gunicorn нужен только на сервере (Linux); локально используется manage.py serve.
 tzdata>=2024.1
 gunicorn>=22,<25
+segno>=1.6,<2

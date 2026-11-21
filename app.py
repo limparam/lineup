@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import io
 import json
 import logging
 import mimetypes
@@ -20,6 +21,8 @@ from datetime import timedelta
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, unquote
+
+import segno
 
 import db
 import security
@@ -1720,6 +1723,41 @@ def api_admin_event_get(req, event_id):
         row = _admin_event_row(conn, session, int(event_id))
         return json_response({"event": _event_json(conn, row, admin=True),
                               "timezones": TIMEZONES})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/qr\.png")
+def api_admin_event_qr(req, event_id):
+    """PNG с QR-кодом публичной страницы мероприятия.
+
+    Файл не хранится на диске: код генерируется на каждый запрос и перестаёт
+    отдаваться, когда мероприятие удалено, не опубликовано или уже прошло.
+    """
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        row = _admin_event_row(conn, session, int(event_id))
+        if not int(row["published"]):
+            raise APIError(404, "not_found",
+                           "QR-код доступен только для опубликованного мероприятия.")
+        if timeutil.parse_iso(row["ends_at"]) <= timeutil.now_utc():
+            raise APIError(404, "not_found",
+                           "Мероприятие уже прошло — QR-код больше не доступен.")
+        url = f"{req.scheme}://{req.host}/e/{row['slug']}"
+        qr = segno.make(url, error="m")
+        buffer = io.BytesIO()
+        qr.save(buffer, kind="png", scale=20, border=4)
+        filename = f"lineup-{row['slug']}-qr.png"
+        return Response(
+            buffer.getvalue(), 200, content_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store, max-age=0",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
     finally:
         conn.close()
 

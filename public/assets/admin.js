@@ -279,6 +279,39 @@ function renderEventList(events) {
     if (isSuper && event.ownerUsername) metaParts.push(`автор: ${event.ownerUsername}`);
     const meta = metaParts.filter(Boolean).join(" · ");
 
+    const actions = [
+      el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "Открыть",
+        onClick: () => openEvent(event.id).catch((error) => toast(error.message, "error")),
+      }),
+    ];
+    if (canShareEvent(event)) {
+      actions.push(el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "Ссылка",
+        title: "Скопировать ссылку на мероприятие",
+        onClick: () => copyEventLink(event).catch((error) => toast(error.message, "error")),
+      }));
+    }
+    if (canDownloadEventQr(event)) {
+      actions.push(el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "QR",
+        title: "Скачать QR-код мероприятия",
+        onClick: () => downloadEventQr(event).catch((error) => toast(error.message, "error")),
+      }));
+    }
+    actions.push(el("button", {
+      class: "btn btn--sm btn--danger",
+      type: "button",
+      text: "Удалить",
+      onClick: () => deleteEventById(event).catch((error) => toast(error.message, "error")),
+    }));
+
     const card = el("article", { class: "admin-event" }, [
       el("div", { class: "admin-event__main" }, [
         el("div", { class: "admin-event__title" }, [
@@ -290,20 +323,7 @@ function renderEventList(events) {
         ]),
         el("div", { class: "admin-event__meta", text: meta }),
       ]),
-      el("div", { class: "admin-event__actions" }, [
-        el("button", {
-          class: "btn btn--sm",
-          type: "button",
-          text: "Открыть",
-          onClick: () => openEvent(event.id).catch((error) => toast(error.message, "error")),
-        }),
-        el("button", {
-          class: "btn btn--sm btn--danger",
-          type: "button",
-          text: "Удалить",
-          onClick: () => deleteEventById(event).catch((error) => toast(error.message, "error")),
-        }),
-      ]),
+      el("div", { class: "admin-event__actions" }, actions),
     ]);
     host.append(card);
   }
@@ -325,6 +345,74 @@ async function deleteEventById(event) {
   toast("Мероприятие удалено");
   current = null;
   await openList();
+}
+
+/* ---------------------------------------------------- ссылка и QR */
+
+function eventPublicUrl(event) {
+  return new URL(`/e/${encodeURIComponent(event.slug)}`, window.location.origin).href;
+}
+
+function canShareEvent(event) {
+  return Boolean(event && event.published && event.publiclyVisible !== false);
+}
+
+function canDownloadEventQr(event) {
+  return canShareEvent(event)
+    && new Date(event.endsAt).getTime() > Date.now();
+}
+
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    area.style.opacity = "0";
+    document.body.append(area);
+    area.select();
+    area.setSelectionRange(0, area.value.length);
+    const ok = document.execCommand("copy");
+    area.remove();
+    if (ok) resolve();
+    else reject(new Error("Браузер не разрешил скопировать ссылку"));
+  });
+}
+
+async function copyEventLink(event) {
+  await copyToClipboard(eventPublicUrl(event));
+  toast("Ссылка на мероприятие скопирована");
+}
+
+async function downloadEventQr(event) {
+  const response = await fetch(`/api/admin/events/${event.id}/qr.png`, {
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    let message = "Не удалось получить QR-код";
+    try {
+      const data = await response.json();
+      message = (data.error && data.error.message) || message;
+    } catch {
+      /* ответ не JSON — оставляем общий текст */
+    }
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = `lineup-${event.slug}-qr.png`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
+  toast("QR-код скачан");
 }
 
 /* -------------------------------------------------------------- ссылки */
@@ -440,6 +528,8 @@ function fillEventForm() {
   const publicLink = $("open-public");
   publicLink.hidden = !current.published || current.publiclyVisible === false;
   publicLink.href = `/e/${encodeURIComponent(current.slug)}`;
+  $("copy-event-link").hidden = !canShareEvent(current);
+  $("download-qr").hidden = !canDownloadEventQr(current);
 }
 
 function sortPerformances(hall) {
@@ -941,6 +1031,8 @@ function newEvent() {
   $("delete-event").hidden = true;
   $("shift-event").hidden = true;
   $("open-public").hidden = true;
+  $("copy-event-link").hidden = true;
+  $("download-qr").hidden = true;
   renderHalls();
   showView("event");
   window.scrollTo({ top: 0 });
@@ -1732,6 +1824,14 @@ $("performers-back").addEventListener("click", () => {
 });
 eventForm.addEventListener("submit", saveEvent);
 $("delete-event").addEventListener("click", deleteCurrentEvent);
+$("copy-event-link").addEventListener("click", () => {
+  if (!current) return;
+  copyEventLink(current).catch((error) => toast(error.message, "error"));
+});
+$("download-qr").addEventListener("click", () => {
+  if (!current) return;
+  downloadEventQr(current).catch((error) => toast(error.message, "error"));
+});
 $("shift-event").addEventListener("click", openShiftDialog);
 $("shift-cancel").addEventListener("click", () => shiftDialog.close());
 shiftForm.addEventListener("submit", submitShift);
