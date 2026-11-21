@@ -1828,10 +1828,106 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIsNone(data["logoUrl"])
         self.assertEqual(data["links"], [])
+        self.assertIn("LineUP", data["copyright"])
+        self.assertIn("расписание мероприятий", data["copyright"])
+        self.assertEqual(data["theme"]["mode"], "preset")
+        self.assertEqual(data["theme"]["id"], "default")
+        self.assertEqual(data["theme"]["colors"]["accent"], "#2bff88")
         self.assertIn("serverNow", data)
 
         status, _, _ = self.client.get("/logo")
         self.assertEqual(status, 404)
+
+    def test_super_manages_site_copyright(self):
+        self.login()
+        status, _, data = self.client.get("/api/admin/site")
+        self.assertEqual(status, 200, data)
+        default_text = data["copyrightDefault"]
+        self.assertTrue(default_text.startswith("© "))
+        self.assertIn("LineUP", default_text)
+        self.assertEqual(data["copyright"], default_text)
+        self.assertEqual(data["themes"][0]["id"], "default")
+        self.assertGreaterEqual(len(data["themes"]), 11)
+
+        custom = "© 2027 NIGHT CLUB — все права защищены"
+        status, _, data = self.client.put(
+            "/api/admin/site/copyright", {"text": custom},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["copyright"], custom)
+        self.assertFalse(data["isDefault"])
+
+        status, _, public = self.client.get("/api/public/site")
+        self.assertEqual(status, 200)
+        self.assertEqual(public["copyright"], custom)
+
+        # Пустой текст возвращает стандартный копирайт.
+        status, _, data = self.client.put(
+            "/api/admin/site/copyright", {"text": ""},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["isDefault"])
+        self.assertEqual(data["copyright"], default_text)
+
+        for payload in ({"text": None}, {"text": 42},
+                        {"text": "x" * 201}, {"text": "a\nb"}):
+            status, _, data = self.client.put(
+                "/api/admin/site/copyright", payload,
+                csrf=self.client.csrf)
+            self.assertEqual(status, 400, (payload, data))
+
+    def test_super_manages_site_theme(self):
+        self.login()
+        status, _, data = self.client.get("/api/admin/site")
+        self.assertEqual(status, 200, data)
+        theme_ids = [item["id"] for item in data["themes"]]
+        self.assertIn("default", theme_ids)
+        self.assertIn("neon", theme_ids)
+        self.assertIn("mono", theme_ids)
+
+        status, _, data = self.client.put(
+            "/api/admin/site/theme", {"mode": "preset", "id": "neon"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["theme"]["mode"], "preset")
+        self.assertEqual(data["theme"]["id"], "neon")
+        self.assertEqual(data["theme"]["colors"]["accent"], "#b66cff")
+
+        status, _, public = self.client.get("/api/public/site")
+        self.assertEqual(status, 200)
+        self.assertEqual(public["theme"]["id"], "neon")
+        self.assertEqual(public["theme"]["colors"]["timing"], "#d08cff")
+
+        custom = {
+            "background": "#101010",
+            "panel": "#202020",
+            "text": "#fafafa",
+            "muted": "#999999",
+            "accent": "#ff8800",
+            "timing": "#00ccff",
+        }
+        status, _, data = self.client.put(
+            "/api/admin/site/theme", {"mode": "custom", "colors": custom},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["theme"]["mode"], "custom")
+        self.assertEqual(data["theme"]["colors"], custom)
+
+        status, _, public = self.client.get("/api/public/site")
+        self.assertEqual(public["theme"]["mode"], "custom")
+        self.assertEqual(public["theme"]["colors"], custom)
+
+        bad_variants = [
+            {"mode": "preset", "id": "unknown"},
+            {"mode": "custom", "colors": {}},
+            {"mode": "custom", "colors": {**custom, "accent": "green"}},
+            {"mode": "preset"},
+            {},
+        ]
+        for payload in bad_variants:
+            status, _, data = self.client.put(
+                "/api/admin/site/theme", payload, csrf=self.client.csrf)
+            self.assertEqual(status, 400, (payload, data))
 
     def test_super_manages_site_links(self):
         self.login()
@@ -1894,6 +1990,8 @@ class LineUPTestCase(unittest.TestCase):
              {"links": [{"label": "x", "description": "y", "url": ""}]}),
             ("PUT", "/api/admin/site/logo", {"data": "x"}),
             ("DELETE", "/api/admin/site/logo", None),
+            ("PUT", "/api/admin/site/copyright", {"text": "x"}),
+            ("PUT", "/api/admin/site/theme", {"mode": "preset", "id": "mono"}),
         ]
         for method, path, body in requests:
             status, _, data = client.request(

@@ -824,8 +824,88 @@ function openSiteDialog(linkData) {
   nodes.dialog.showModal();
 }
 
+function clampByte(value) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function shiftHex(hex, amount) {
+  const match = /^#([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!match) return hex;
+  const value = parseInt(match[1], 16);
+  const r = clampByte(((value >> 16) & 255) + amount);
+  const g = clampByte(((value >> 8) & 255) + amount);
+  const b = clampByte((value & 255) + amount);
+  return `#${[r, g, b].map((part) => part.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function rgbaFromHex(hex, alpha) {
+  const match = /^#([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!match) return `rgba(43, 255, 136, ${alpha})`;
+  const value = parseInt(match[1], 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function applySiteTheme(theme) {
+  if (!theme || !theme.colors) return;
+  const colors = theme.colors;
+  const bg = colors.background || "#06070a";
+  const panel = colors.panel || "#0e1117";
+  const text = colors.text || "#f2f5f7";
+  const muted = colors.muted || "#98a2b3";
+  const accent = colors.accent || "#2bff88";
+  const secondary = colors.secondary || accent;
+  const timing = colors.timing || accent;
+  const timingDeep = colors.timingDeep || shiftHex(timing, -18);
+  const root = document.documentElement.style;
+  const variables = {
+    "--bg": bg,
+    "--bg-soft": shiftHex(bg, 5),
+    "--bg-top": shiftHex(bg, 4),
+    "--bg-bottom": shiftHex(bg, -3),
+    "--panel": panel,
+    "--panel-2": shiftHex(panel, 7),
+    "--line": rgbaFromHex(text, 0.09),
+    "--line-strong": rgbaFromHex(text, 0.17),
+    "--text": text,
+    "--muted": muted,
+    "--muted-2": shiftHex(muted, -12),
+    "--green": accent,
+    "--green-deep": shiftHex(accent, -18),
+    "--green-soft": rgbaFromHex(accent, 0.12),
+    "--green-line": rgbaFromHex(accent, 0.42),
+    "--timing": timing,
+    "--timing-deep": timingDeep,
+    "--timing-glow": rgbaFromHex(timing, 0.55),
+    "--glow-1": rgbaFromHex(accent, 0.1),
+    "--glow-2": rgbaFromHex(secondary, 0.12),
+    "--grid": rgbaFromHex(text, 0.028),
+  };
+  for (const [name, value] of Object.entries(variables)) {
+    root.setProperty(name, value);
+  }
+  const accentAlphas = [
+    ["015", 0.015], ["02", 0.02], ["025", 0.025], ["03", 0.03],
+    ["04", 0.04], ["06", 0.06], ["07", 0.07], ["08", 0.08],
+    ["09", 0.09], ["10", 0.1], ["12", 0.12], ["13", 0.13],
+    ["22", 0.22], ["25", 0.25], ["28", 0.28], ["32", 0.32],
+    ["35", 0.35], ["42", 0.42], ["55", 0.55], ["60", 0.6],
+    ["70", 0.7],
+  ];
+  for (const [suffix, alpha] of accentAlphas) {
+    root.setProperty(`--accent-${suffix}`, rgbaFromHex(accent, alpha));
+  }
+}
+
 export function renderSiteChrome(data) {
-  const logoUrl = data && data.logoUrl ? data.logoUrl : "";
+  const info = data || {};
+  applySiteTheme(info.theme);
+  const copyright = document.getElementById("footer-copyright");
+  if (copyright && info.copyright) copyright.textContent = info.copyright;
+
+  const logoUrl = info.logoUrl ? info.logoUrl : "";
   for (const brand of document.querySelectorAll("a.brand")) {
     applyBrandLogo(brand, logoUrl);
   }
@@ -833,7 +913,7 @@ export function renderSiteChrome(data) {
   const footer = document.getElementById("footer-links");
   if (!footer) return;
   clear(footer);
-  const links = data && Array.isArray(data.links) ? data.links : [];
+  const links = Array.isArray(info.links) ? info.links : [];
   footer.hidden = links.length === 0;
   for (const link of links) {
     footer.append(

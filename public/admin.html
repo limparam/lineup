@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=19">
+  <link rel="stylesheet" href="/assets/style.css?v=20">
 </head>
 <body>
   <header class="adminbar">
@@ -345,7 +345,7 @@
           <button class="btn btn--ghost btn--sm" id="site-back" type="button">← К мероприятиям</button>
           <h1 class="admin-title">Сайт</h1>
           <p class="admin-sub">
-            Логотип вместо надписи LineUP и кнопки в подвале публичных страниц.
+            Логотип, копирайт, оформление и кнопки в подвале публичных страниц.
           </p>
         </div>
       </div>
@@ -391,6 +391,78 @@
             <span class="spacer"></span>
             <button class="btn btn--primary" id="site-save-links" type="button">
               Сохранить кнопки
+            </button>
+          </div>
+        </div>
+
+        <div class="panel panel--wide">
+          <div class="panel__head">
+            <h2 class="panel__title">Оформление</h2>
+            <span class="muted small" id="site-theme-current"></span>
+          </div>
+          <p class="field__hint">
+            Тема меняет фон, панели, текст, акценты и полосу тайминга на публичных
+            страницах. Выберите готовую тему или настройте свои цвета.
+          </p>
+          <div class="site-theme-grid" id="site-theme-grid"></div>
+          <div class="site-theme-custom" id="site-theme-custom" hidden>
+            <div class="theme-colors">
+              <label class="theme-color">
+                <span>Фон</span>
+                <input id="theme-color-background" type="color" value="#06070a">
+                <output id="theme-value-background">#06070a</output>
+              </label>
+              <label class="theme-color">
+                <span>Панели</span>
+                <input id="theme-color-panel" type="color" value="#0e1117">
+                <output id="theme-value-panel">#0e1117</output>
+              </label>
+              <label class="theme-color">
+                <span>Основной текст</span>
+                <input id="theme-color-text" type="color" value="#f2f5f7">
+                <output id="theme-value-text">#f2f5f7</output>
+              </label>
+              <label class="theme-color">
+                <span>Приглушённый текст</span>
+                <input id="theme-color-muted" type="color" value="#98a2b3">
+                <output id="theme-value-muted">#98a2b3</output>
+              </label>
+              <label class="theme-color">
+                <span>Акцент</span>
+                <input id="theme-color-accent" type="color" value="#2bff88">
+                <output id="theme-value-accent">#2bff88</output>
+              </label>
+              <label class="theme-color">
+                <span>Полоса тайминга</span>
+                <input id="theme-color-timing" type="color" value="#2bff88">
+                <output id="theme-value-timing">#2bff88</output>
+              </label>
+            </div>
+            <span class="field__hint">
+              Свои цвета сохраняются отдельно от готовых тем.
+            </span>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn--primary" id="site-save-theme" type="button">
+              Сохранить оформление
+            </button>
+          </div>
+        </div>
+
+        <div class="panel panel--wide">
+          <div class="panel__head">
+            <h2 class="panel__title">Копирайт</h2>
+            <span class="muted small" id="site-copyright-state"></span>
+          </div>
+          <div class="field">
+            <label for="site-copyright">Текст в подвале</label>
+            <input id="site-copyright" type="text" maxlength="200"
+                   placeholder="© 2026 LineUP — расписание мероприятий">
+            <span class="field__hint" id="site-copyright-hint"></span>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn--primary" id="site-save-copyright" type="button">
+              Сохранить копирайт
             </button>
           </div>
         </div>
@@ -466,6 +538,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=19"></script>
+  <script type="module" src="/assets/admin.js?v=25"></script>
 </body>
 </html>

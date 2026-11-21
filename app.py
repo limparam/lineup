@@ -387,10 +387,83 @@ MAX_EVENT_LINKS = 12
 
 MAX_SITE_LINKS = 8
 SITE_LOGO_KEY = "logo_png"
+SITE_COPYRIGHT_KEY = "copyright_text"
+SITE_THEME_KEY = "theme"
 # 180 КБ в base64 занимают меньше 256 КБ, лимита тела запроса.
 MAX_LOGO_BYTES = 180 * 1024
 MAX_LOGO_SIDE = 5000
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+CUSTOM_THEME_KEYS = ("background", "panel", "text", "muted", "accent", "timing")
+
+
+def _site_theme(theme_id: str, name: str, description: str, *,
+                background: str, panel: str, text: str, muted: str,
+                accent: str, secondary: str, timing: str,
+                timing_deep: str) -> dict:
+    return {
+        "id": theme_id,
+        "name": name,
+        "description": description,
+        "colors": {
+            "background": background,
+            "panel": panel,
+            "text": text,
+            "muted": muted,
+            "accent": accent,
+            "secondary": secondary,
+            "timing": timing,
+            "timingDeep": timing_deep,
+        },
+    }
+
+
+SITE_THEMES = [
+    _site_theme("default", "Изумруд", "Текущий стиль LineUP",
+                background="#06070a", panel="#0e1117", text="#f2f5f7",
+                muted="#98a2b3", accent="#2bff88", secondary="#606cff",
+                timing="#2bff88", timing_deep="#17d96f"),
+    _site_theme("neon", "Неон", "Фиолетовый неон и розовые акценты",
+                background="#08060f", panel="#12101d", text="#f4f0ff",
+                muted="#a79ac9", accent="#b66cff", secondary="#ff5ed2",
+                timing="#d08cff", timing_deep="#9b4dff"),
+    _site_theme("cyber", "Кибер", "Холодный синий и бирюза",
+                background="#050a12", panel="#0c1522", text="#eaf6ff",
+                muted="#86a3bf", accent="#39c6ff", secondary="#7c5cff",
+                timing="#6fe0ff", timing_deep="#1aa3e8"),
+    _site_theme("sunset", "Закат", "Тёплый оранжевый и красный",
+                background="#0f0806", panel="#1c110c", text="#fff1e8",
+                muted="#c49a86", accent="#ff8a3d", secondary="#ff4d6d",
+                timing="#ffb15c", timing_deep="#ff6a00"),
+    _site_theme("crimson", "Красный бархат", "Бордовый клубный стиль",
+                background="#100608", panel="#1d0c11", text="#ffeef1",
+                muted="#c18d99", accent="#ff4d6d", secondary="#ff9f43",
+                timing="#ff7a90", timing_deep="#d61f45"),
+    _site_theme("ice", "Лёд", "Ледяной голубой свет",
+                background="#050b10", panel="#0b1620", text="#eafcff",
+                muted="#8fb3c2", accent="#7fe9ff", secondary="#a7c7ff",
+                timing="#b4f4ff", timing_deep="#38c8e6"),
+    _site_theme("gold", "Золото", "Лаунж с золотыми акцентами",
+                background="#0d0a05", panel="#1a150a", text="#fff6df",
+                muted="#c9b184", accent="#f5c15c", secondary="#ff8a3d",
+                timing="#ffd98a", timing_deep="#e0a72e"),
+    _site_theme("magenta", "Магента", "Яркий розовый неон",
+                background="#100611", panel="#1c0b1d", text="#ffeaf9",
+                muted="#c48bb2", accent="#ff5ed2", secondary="#b66cff",
+                timing="#ff8ee0", timing_deep="#e026b4"),
+    _site_theme("acid", "Кислота", "Кислотный лайм и зелёный",
+                background="#080b05", panel="#131a0c", text="#f4ffe3",
+                muted="#a7ba86", accent="#c6ff3d", secondary="#39ff88",
+                timing="#dbff77", timing_deep="#a8e600"),
+    _site_theme("mono", "Монохром", "Строгий чёрно-белый стиль",
+                background="#08090b", panel="#13151a", text="#f5f7fa",
+                muted="#9aa3b2", accent="#d7dde7", secondary="#8b93a1",
+                timing="#ffffff", timing_deep="#b7c0cf"),
+    _site_theme("purple", "Глубокий фиолет", "Тёмный фиолетовый и лаванда",
+                background="#080713", panel="#121128", text="#efedff",
+                muted="#9c96c9", accent="#8a7dff", secondary="#ff5ed2",
+                timing="#a99fff", timing_deep="#6b5cff"),
+]
 
 LINEUP_FILTERS = ("all", "live", "played")
 
@@ -533,6 +606,64 @@ def _site_logo_info(conn) -> dict:
         "logoUpdatedAt": row["updated_at"] or None,
         "logoBytes": len(data),
     }
+
+
+def _site_setting_row(conn, key: str):
+    return conn.execute(
+        "SELECT value, updated_at FROM site_settings WHERE key = ?", (key,)
+    ).fetchone()
+
+
+def _default_copyright() -> str:
+    return f"© {timeutil.now_utc().year} LineUP — расписание мероприятий"
+
+
+def _site_copyright(conn) -> str:
+    row = _site_setting_row(conn, SITE_COPYRIGHT_KEY)
+    if row and isinstance(row["value"], str) and row["value"].strip():
+        return row["value"].strip()
+    return _default_copyright()
+
+
+def _theme_by_id(theme_id: str) -> dict | None:
+    return next((item for item in SITE_THEMES if item["id"] == theme_id), None)
+
+
+def _custom_theme_colors(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    colors = {}
+    for key in CUSTOM_THEME_KEYS:
+        item = value.get(key)
+        if not isinstance(item, str) or not HEX_COLOR_RE.fullmatch(item):
+            return None
+        colors[key] = item.lower()
+    return colors
+
+
+def _site_theme_info(conn) -> dict:
+    row = _site_setting_row(conn, SITE_THEME_KEY)
+    if row and isinstance(row["value"], str) and row["value"].strip():
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, ValueError):
+            value = {}
+        if isinstance(value, dict):
+            if value.get("mode") == "preset":
+                theme = _theme_by_id(str(value.get("id") or ""))
+                if theme:
+                    return {**theme, "mode": "preset"}
+            if value.get("mode") == "custom":
+                colors = _custom_theme_colors(value.get("colors"))
+                if colors:
+                    return {
+                        "mode": "custom",
+                        "id": "custom",
+                        "name": "Своя тема",
+                        "description": "Собственные цвета",
+                        "colors": colors,
+                    }
+    return {**SITE_THEMES[0], "mode": "preset"}
 
 
 def _site_links(conn) -> list[dict]:
@@ -941,7 +1072,12 @@ def api_public_events(req):
 def api_public_site(req):
     conn = db.connect()
     try:
-        data = {"links": _site_links(conn), "serverNow": timeutil.iso_now()}
+        data = {
+            "links": _site_links(conn),
+            "copyright": _site_copyright(conn),
+            "theme": _site_theme_info(conn),
+            "serverNow": timeutil.iso_now(),
+        }
         data.update(_site_logo_info(conn))
         return json_response(data)
     finally:
@@ -1436,7 +1572,13 @@ def api_admin_site(req):
     _require_super(req, csrf=False)
     conn = db.connect()
     try:
-        data = {"links": _site_links(conn)}
+        data = {
+            "links": _site_links(conn),
+            "copyright": _site_copyright(conn),
+            "copyrightDefault": _default_copyright(),
+            "theme": _site_theme_info(conn),
+            "themes": SITE_THEMES,
+        }
         data.update(_site_logo_info(conn))
         data.update({
             "maxLinks": MAX_SITE_LINKS,
@@ -1444,6 +1586,81 @@ def api_admin_site(req):
             "maxLogoSide": MAX_LOGO_SIDE,
         })
         return json_response(data)
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/site/copyright", methods=("PUT", "PATCH"))
+def api_admin_site_copyright(req):
+    session = _require_super(req)
+    data = req.json()
+    text = data.get("text", "")
+    if not isinstance(text, str):
+        raise APIError(400, "validation", "Копирайт должен быть строкой.")
+    text = text.strip()
+    if len(text) > 200:
+        raise APIError(400, "validation",
+                       "Копирайт длиннее 200 символов.")
+    if "\n" in text or "\r" in text:
+        raise APIError(400, "validation",
+                       "Копирайт должен быть в одну строку.")
+    conn = db.connect()
+    try:
+        if text:
+            conn.execute(
+                "INSERT INTO site_settings (key, value, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+                "value = excluded.value, updated_at = excluded.updated_at",
+                (SITE_COPYRIGHT_KEY, text, timeutil.iso_now()),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM site_settings WHERE key = ?", (SITE_COPYRIGHT_KEY,))
+        _audit(conn, session, "site.copyright", entity="site",
+               detail=text or "сброшен к стандартному")
+        conn.commit()
+        return json_response({
+            "copyright": _site_copyright(conn),
+            "isDefault": not bool(text),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/site/theme", methods=("PUT", "PATCH"))
+def api_admin_site_theme(req):
+    session = _require_super(req)
+    data = req.json()
+    mode = data.get("mode")
+    if mode == "preset":
+        theme = _theme_by_id(str(data.get("id") or ""))
+        if not theme:
+            raise APIError(400, "validation", "Неизвестная тема оформления.")
+        setting = {"mode": "preset", "id": theme["id"]}
+        detail = f"тема «{theme['name']}»"
+    elif mode == "custom":
+        colors = _custom_theme_colors(data.get("colors"))
+        if not colors:
+            raise APIError(400, "validation",
+                           "Укажите корректные цвета в формате #RRGGBB.")
+        setting = {"mode": "custom", "colors": colors}
+        detail = "своя тема · " + ", ".join(
+            f"{key}: {value}" for key, value in colors.items())
+    else:
+        raise APIError(400, "validation", "Выберите тему оформления.")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "INSERT INTO site_settings (key, value, updated_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+            "value = excluded.value, updated_at = excluded.updated_at",
+            (SITE_THEME_KEY, json.dumps(setting, ensure_ascii=False,
+                                        separators=(",", ":")),
+             timeutil.iso_now()),
+        )
+        _audit(conn, session, "site.theme", entity="site", detail=detail)
+        conn.commit()
+        return json_response({"theme": _site_theme_info(conn)})
     finally:
         conn.close()
 

@@ -5,7 +5,7 @@ import {
   eventStatus,
   formatRangeShort,
   plural,
-} from "./common.js?v=17";
+} from "./common.js?v=19";
 
 const $ = (id) => document.getElementById(id);
 
@@ -1396,11 +1396,160 @@ let siteLogoUrl = null;
 let siteLogoBytes = 0;
 let siteMaxLinks = 8;
 let siteMaxLogoBytes = 180 * 1024;
+let siteThemes = [];
+let siteTheme = null;
+let siteCustomColors = {
+  background: "#06070a",
+  panel: "#0e1117",
+  text: "#f2f5f7",
+  muted: "#98a2b3",
+  accent: "#2bff88",
+  timing: "#2bff88",
+};
+let selectedTheme = { mode: "preset", id: "default" };
+let siteCopyrightDefault = "";
+
+const THEME_COLOR_KEYS = ["background", "panel", "text", "muted", "accent", "timing"];
 
 function formatBytes(bytes) {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
   if (bytes >= 1024) return `${Math.round(bytes / 1024)} КБ`;
   return `${bytes} Б`;
+}
+
+function themeSwatch(color) {
+  const node = document.createElement("i");
+  node.style.background = color;
+  return node;
+}
+
+function themeCard(theme, active) {
+  const colors = theme.colors || siteCustomColors;
+  return el("button", {
+    class: "site-theme-card" + (active ? " is-active" : ""),
+    type: "button",
+    dataset: { themeId: theme.id },
+    onClick: () => selectTheme(theme.id === "custom" ? "custom" : "preset", theme.id),
+  }, [
+    el("span", { class: "site-theme-card__swatches" }, [
+      themeSwatch(colors.background || "#06070a"),
+      themeSwatch(colors.panel || "#0e1117"),
+      themeSwatch(colors.accent || "#2bff88"),
+      themeSwatch(colors.text || "#f2f5f7"),
+      themeSwatch(colors.timing || colors.accent || "#2bff88"),
+    ]),
+    el("span", { class: "site-theme-card__name", text: theme.name }),
+    el("span", { class: "site-theme-card__desc", text: theme.description }),
+  ]);
+}
+
+function renderThemeGrid() {
+  const host = $("site-theme-grid");
+  clear(host);
+  for (const theme of siteThemes) {
+    host.append(themeCard(theme, selectedTheme.mode === "preset"
+      && selectedTheme.id === theme.id));
+  }
+  host.append(themeCard({
+    id: "custom",
+    name: "Своя тема",
+    description: "Настроить цвета вручную",
+    colors: siteCustomColors,
+  }, selectedTheme.mode === "custom"));
+}
+
+function setThemeColorInputs(colors) {
+  for (const key of THEME_COLOR_KEYS) {
+    const value = colors[key] || "#000000";
+    const input = $(`theme-color-${key}`);
+    if (input) input.value = value;
+    const output = $(`theme-value-${key}`);
+    if (output) output.textContent = value;
+  }
+}
+
+function readThemeColors() {
+  return Object.fromEntries(THEME_COLOR_KEYS.map((key) => [
+    key, $(`theme-color-${key}`).value,
+  ]));
+}
+
+function selectTheme(mode, themeId) {
+  selectedTheme = mode === "custom"
+    ? { mode: "custom" }
+    : { mode: "preset", id: themeId };
+  if (mode !== "custom") {
+    const theme = siteThemes.find((item) => item.id === themeId);
+    if (theme) siteCustomColors = { ...theme.colors };
+  }
+  $("site-theme-custom").hidden = mode !== "custom";
+  if (mode === "custom") setThemeColorInputs(siteCustomColors);
+  renderThemeGrid();
+}
+
+function renderThemeState(theme) {
+  siteTheme = theme;
+  siteCustomColors = { ...(theme.colors || siteCustomColors) };
+  selectedTheme = theme.mode === "custom"
+    ? { mode: "custom" }
+    : { mode: "preset", id: theme.id || "default" };
+  $("site-theme-current").textContent = `Сейчас: ${theme.name || "Изумруд"}`;
+  $("site-theme-custom").hidden = theme.mode !== "custom";
+  setThemeColorInputs(siteCustomColors);
+  renderThemeGrid();
+}
+
+async function saveSiteTheme() {
+  const button = $("site-save-theme");
+  setBusy(button, true);
+  try {
+    let body;
+    if (selectedTheme.mode === "custom") {
+      siteCustomColors = readThemeColors();
+      body = { mode: "custom", colors: siteCustomColors };
+    } else {
+      body = { mode: "preset", id: selectedTheme.id };
+    }
+    const data = await request("/api/admin/site/theme", {
+      method: "PUT",
+      body,
+    });
+    renderThemeState(data.theme);
+    toast("Оформление сохранено");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function applySiteCopyright(data) {
+  siteCopyrightDefault = data.copyrightDefault || siteCopyrightDefault;
+  const current = data.copyright || siteCopyrightDefault;
+  $("site-copyright").value = current;
+  $("site-copyright-hint").textContent = siteCopyrightDefault
+    ? `По умолчанию: ${siteCopyrightDefault}`
+    : "";
+  $("site-copyright-state").textContent = current === siteCopyrightDefault
+    ? "стандартный"
+    : "изменён";
+}
+
+async function saveSiteCopyright() {
+  const button = $("site-save-copyright");
+  setBusy(button, true);
+  try {
+    const data = await request("/api/admin/site/copyright", {
+      method: "PUT",
+      body: { text: $("site-copyright").value.trim() },
+    });
+    applySiteCopyright({ ...data, copyrightDefault: siteCopyrightDefault });
+    toast("Копирайт сохранён");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 function renderSiteLogo() {
@@ -1632,6 +1781,9 @@ async function openSite() {
   $("site-logo-file").value = "";
   applySiteLogo(data);
   renderSiteLinks(data.links || []);
+  siteThemes = data.themes || [];
+  applySiteCopyright(data);
+  renderThemeState(data.theme);
   showView("site");
   window.scrollTo({ top: 0 });
 }
@@ -1653,6 +1805,8 @@ const AUDIT_LABELS = {
   "performer.delete": "Удалил артиста из подсказок",
   "site.links": "Изменил кнопки в подвале",
   "site.logo": "Изменил логотип сайта",
+  "site.copyright": "Изменил копирайт",
+  "site.theme": "Изменил оформление сайта",
   "user.create": "Добавил администратора",
   "user.update": "Сменил пароль администратора",
   "user.delete": "Удалил администратора",
@@ -1771,6 +1925,24 @@ $("site-back").addEventListener("click", () => {
 });
 $("site-add-link").addEventListener("click", addSiteLink);
 $("site-save-links").addEventListener("click", saveSiteLinks);
+$("site-save-theme").addEventListener("click", () => {
+  saveSiteTheme().catch((error) => toast(error.message, "error"));
+});
+$("site-save-copyright").addEventListener("click", () => {
+  saveSiteCopyright().catch((error) => toast(error.message, "error"));
+});
+for (const key of THEME_COLOR_KEYS) {
+  const input = $(`theme-color-${key}`);
+  if (!input) continue;
+  input.addEventListener("input", () => {
+    const output = $(`theme-value-${key}`);
+    if (output) output.textContent = input.value;
+    if (selectedTheme.mode === "custom") {
+      siteCustomColors = readThemeColors();
+      renderThemeGrid();
+    }
+  });
+}
 $("site-logo-upload").addEventListener("click", uploadSiteLogo);
 $("site-logo-remove").addEventListener("click", removeSiteLogo);
 $("site-logo-file").addEventListener("change", () => {
