@@ -1072,13 +1072,24 @@ def api_public_events(req):
 def api_public_site(req):
     conn = db.connect()
     try:
+        links = _site_links(conn)
+        copyright = _site_copyright(conn)
+        theme = _site_theme_info(conn)
+        logo = _site_logo_info(conn)
+        fingerprint = json.dumps({
+            "links": links,
+            "copyright": copyright,
+            "theme": theme,
+            "logoVersion": logo.get("logoVersion"),
+        }, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         data = {
-            "links": _site_links(conn),
-            "copyright": _site_copyright(conn),
-            "theme": _site_theme_info(conn),
+            "links": links,
+            "copyright": copyright,
+            "theme": theme,
+            "siteVersion": hashlib.sha256(fingerprint).hexdigest()[:16],
             "serverNow": timeutil.iso_now(),
         }
-        data.update(_site_logo_info(conn))
+        data.update(logo)
         return json_response(data)
     finally:
         conn.close()

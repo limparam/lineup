@@ -1833,6 +1833,7 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(data["theme"]["mode"], "preset")
         self.assertEqual(data["theme"]["id"], "default")
         self.assertEqual(data["theme"]["colors"]["accent"], "#2bff88")
+        self.assertIn("siteVersion", data)
         self.assertIn("serverNow", data)
 
         status, _, _ = self.client.get("/logo")
@@ -1885,6 +1886,10 @@ class LineUPTestCase(unittest.TestCase):
         self.assertIn("neon", theme_ids)
         self.assertIn("mono", theme_ids)
 
+        status, _, public = self.client.get("/api/public/site")
+        self.assertEqual(status, 200)
+        default_version = public["siteVersion"]
+
         status, _, data = self.client.put(
             "/api/admin/site/theme", {"mode": "preset", "id": "neon"},
             csrf=self.client.csrf)
@@ -1897,6 +1902,7 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(public["theme"]["id"], "neon")
         self.assertEqual(public["theme"]["colors"]["timing"], "#d08cff")
+        self.assertNotEqual(public["siteVersion"], default_version)
 
         custom = {
             "background": "#101010",

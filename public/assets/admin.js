@@ -5,7 +5,7 @@ import {
   eventStatus,
   formatRangeShort,
   plural,
-} from "./common.js?v=19";
+} from "./common.js?v=20";
 
 const $ = (id) => document.getElementById(id);
 

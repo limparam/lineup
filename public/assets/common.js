@@ -927,13 +927,53 @@ export function renderSiteChrome(data) {
   }
 }
 
-export async function loadSiteChrome() {
+const SITE_REFRESH_MS = 60000;
+let siteRefreshStarted = false;
+let siteRefreshInFlight = false;
+let siteVersion = "";
+
+async function fetchSiteChrome() {
   try {
-    const data = await api("/api/public/site");
-    renderSiteChrome(data);
-    return data;
+    return await api("/api/public/site");
   } catch {
     // Оформление сайта не критично для основного содержимого.
     return null;
   }
+}
+
+function refreshSiteChrome() {
+  if (siteRefreshInFlight) return;
+  siteRefreshInFlight = true;
+  fetchSiteChrome()
+    .then((data) => {
+      if (!data) return;
+      if (data.siteVersion && data.siteVersion === siteVersion) return;
+      siteVersion = data.siteVersion || "";
+      renderSiteChrome(data);
+    })
+    .finally(() => {
+      siteRefreshInFlight = false;
+    });
+}
+
+function ensureSiteChromeRefresh() {
+  if (siteRefreshStarted) return;
+  siteRefreshStarted = true;
+  setInterval(() => {
+    if (document.visibilityState === "visible") refreshSiteChrome();
+  }, SITE_REFRESH_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshSiteChrome();
+  });
+  window.addEventListener("focus", refreshSiteChrome);
+}
+
+export async function loadSiteChrome() {
+  const data = await fetchSiteChrome();
+  if (data) {
+    siteVersion = data.siteVersion || "";
+    renderSiteChrome(data);
+  }
+  ensureSiteChromeRefresh();
+  return data;
 }
