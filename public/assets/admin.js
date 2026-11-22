@@ -1014,7 +1014,7 @@ function renderGuestHeader() {
   const activeList = currentGuestList();
   $("guests-new-list").hidden = guestRole !== "owner";
   $("guests-open-event").hidden = guestRole !== "owner";
-  $("guests-door-link").hidden = guestRole !== "owner" || !guestInvitesAvailable();
+  $("guests-door-link").hidden = guestRole !== "owner";
   $("guest-list-delete").hidden = guestRole !== "owner" || !activeList
     || activeList.isBlacklist;
   renderGuestPromoters();

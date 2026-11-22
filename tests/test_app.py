@@ -1496,6 +1496,20 @@ class LineUPTestCase(unittest.TestCase):
         status, _, _ = self.client.get(f"/api/public/guests/{token}")
         self.assertEqual(status, 404)
 
+    def test_door_link_works_for_draft_event(self):
+        event = self.create_event(title="DRAFT DOOR", published=False)
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/door-link", {},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        token = data["link"]["path"].rsplit("/", 1)[-1]
+        status, _, data = self.client.get(f"/api/door/{token}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["title"], "DRAFT DOOR")
+        status, headers, _ = self.client.get(f"/door/{token}")
+        self.assertEqual(status, 200)
+        self.assertIn("camera=(self)", headers["permissions-policy"])
+
     def test_guest_list_validation_and_public_visibility(self):
         event = self.create_event(title="GUEST VALIDATION")
         status, _, data = self.client.post(

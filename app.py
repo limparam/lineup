@@ -2486,8 +2486,6 @@ def _door_link_row(conn, token: str):
     if not row:
         raise APIError(404, "not_found",
                        "Ссылка для охраны или персонала недействительна.")
-    if not int(row["published"]):
-        raise APIError(404, "not_found", "Мероприятие не опубликовано.")
     if row["ends_at"] < timeutil.iso_now():
         raise APIError(404, "not_found", "Мероприятие уже прошло.")
     return row
