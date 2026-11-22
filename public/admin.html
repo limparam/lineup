@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=20">
+  <link rel="stylesheet" href="/assets/style.css?v=30">
 </head>
 <body>
   <header class="adminbar">
@@ -59,7 +59,7 @@
       <div class="admin-head">
         <div>
           <h1 class="admin-title">Мероприятия</h1>
-          <p class="admin-sub">Создавайте события, добавляйте залы и расписание сетов.</p>
+          <p class="admin-sub" id="events-sub">Создавайте события, добавляйте залы и расписание сетов.</p>
         </div>
         <button class="btn btn--primary" id="new-event" type="button">+ Новое мероприятие</button>
       </div>
@@ -75,6 +75,9 @@
           <p class="admin-sub" id="event-sub"></p>
         </div>
         <div class="admin-head__side">
+          <button class="btn btn--ghost btn--sm" id="event-guests-btn" type="button" hidden>
+            Гости
+          </button>
           <button class="btn btn--ghost btn--sm" id="copy-event-link" type="button" hidden>
             Скопировать ссылку
           </button>
@@ -243,14 +246,134 @@
       </div>
     </section>
 
-    <!-- Администраторы (только супер) ------------------------------------ -->
+    <!-- Гостевые списки -------------------------------------------------- -->
+    <section id="view-guests" hidden>
+      <div class="admin-head">
+        <div>
+          <button class="btn btn--ghost btn--sm" id="guests-back" type="button">
+            ← К мероприятиям
+          </button>
+          <h1 class="admin-title" id="guests-title">Гости</h1>
+          <p class="admin-sub" id="guests-sub"></p>
+        </div>
+        <div class="admin-head__side">
+          <button class="btn btn--ghost btn--sm" id="guests-door-link" type="button" hidden>
+            Ссылка для охраны или персонала
+          </button>
+          <button class="btn btn--ghost btn--sm" id="guests-open-event" type="button" hidden>
+            Настройки мероприятия
+          </button>
+          <button class="btn btn--primary btn--sm" id="guests-new-list" type="button" hidden>
+            + Новый список
+          </button>
+        </div>
+      </div>
+
+      <div class="panel guest-promoters-panel" id="guest-promoters-panel" hidden>
+        <div class="panel__head">
+          <h2 class="panel__title">Промоутеры</h2>
+          <span class="muted small" id="guest-promoters-scope"></span>
+        </div>
+        <div class="guest-promoter-form">
+          <input id="guest-promoter-input" type="text" maxlength="80"
+                 autocomplete="off" autocapitalize="none" spellcheck="false"
+                 placeholder="Логин промоутера"
+                 list="guest-promoter-datalist"
+                 aria-label="Логин промоутера">
+          <datalist id="guest-promoter-datalist"></datalist>
+          <select id="guest-promoter-scope" aria-label="Куда добавить промоутера">
+            <option value="list">В выбранный список</option>
+            <option value="all">Во все списки</option>
+          </select>
+          <button class="btn btn--primary" id="guest-promoter-add" type="button">
+            Добавить
+          </button>
+          <button class="btn btn--ghost" id="guest-promoter-create" type="button">
+            Создать промоутера
+          </button>
+        </div>
+        <div class="promoter-suggestions" id="guest-promoter-suggestions"></div>
+        <div class="guest-promoter-chips" id="guest-promoter-chips"></div>
+        <p class="field__hint" id="guest-promoter-hint">
+          Можно назначить нескольких промоутеров на список или сразу на все списки.
+        </p>
+        <p class="form-error" id="guest-promoter-error" role="alert" hidden></p>
+      </div>
+
+      <div class="panel guest-registration-panel" id="guest-registration-panel" hidden>
+        <div class="panel__head">
+          <h2 class="panel__title">Саморегистрация</h2>
+          <button class="btn btn--primary btn--sm" id="registration-link-new"
+                  type="button">+ Создать ссылку</button>
+        </div>
+        <div class="registration-links" id="registration-links-list"></div>
+        <p class="field__hint">
+          Ссылки для самостоятельной регистрации гостей. Можно ограничить срок,
+          количество регистраций и оставить комментарий для себя.
+        </p>
+      </div>
+
+      <div class="panel guest-toolbar">
+        <div class="field">
+          <label for="guest-list-select">Гостевой список</label>
+          <div class="guest-list-row">
+            <select id="guest-list-select"></select>
+            <button class="btn btn--sm btn--danger" id="guest-list-delete"
+                    type="button" hidden>Удалить</button>
+          </div>
+        </div>
+        <div class="guest-stats" id="guest-stats"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel__head">
+          <h2 class="panel__title" id="guest-add-title">Добавить гостя</h2>
+          <span class="muted small" id="guest-list-role"></span>
+        </div>
+        <form id="guest-add-form" class="guest-add-form" novalidate>
+          <label class="guest-add-field guest-add-field--name">
+            <span>Имя гостя</span>
+            <input id="guest-name" type="text" maxlength="120" required
+                   autocomplete="off" placeholder="Иван Петров">
+          </label>
+          <label class="guest-add-field">
+            <span>Телефон</span>
+            <input id="guest-phone" type="tel" maxlength="40"
+                   autocomplete="off" inputmode="tel" placeholder="+7 …">
+          </label>
+          <label class="guest-add-field">
+            <span>Стол</span>
+            <input id="guest-table" type="text" maxlength="40"
+                   autocomplete="off" placeholder="Стол 7">
+          </label>
+          <label class="guest-add-field guest-add-field--wide">
+            <span>Заметка</span>
+            <input id="guest-notes" type="text" maxlength="500"
+                   autocomplete="off" placeholder="Необязательно">
+          </label>
+          <button class="btn btn--primary guest-add-submit" type="submit">
+            + Добавить
+          </button>
+        </form>
+
+        <div class="guest-list-tools">
+          <input id="guest-search" type="search" placeholder="Найти гостя по имени или телефону"
+                 autocomplete="off" spellcheck="false" aria-label="Поиск гостя">
+          <span class="muted small" id="guest-count"></span>
+        </div>
+        <div class="guest-list" id="guest-list"></div>
+      </div>
+    </section>
+
+    <!-- Пользователи: администраторы и промоутеры ---------------------- -->
     <section id="view-users" hidden>
       <div class="admin-head">
         <div>
           <button class="btn btn--ghost btn--sm" id="users-back" type="button">← К мероприятиям</button>
-          <h1 class="admin-title">Администраторы</h1>
-          <p class="admin-sub">
-            Главный администратор может добавлять, удалять и менять пароли остальным.
+          <h1 class="admin-title" id="users-title">Администраторы и промоутеры</h1>
+          <p class="admin-sub" id="users-sub">
+            Главный администратор видит всех. Остальные администраторы управляют
+            только созданными ими промоутерами.
           </p>
         </div>
       </div>
@@ -258,7 +381,7 @@
       <div class="admin-grid">
         <div class="panel">
           <div class="panel__head">
-            <h2 class="panel__title">Новый администратор</h2>
+            <h2 class="panel__title" id="add-user-title">Новый пользователь</h2>
           </div>
           <form id="add-user-form" class="stack" novalidate>
             <div class="field">
@@ -272,6 +395,20 @@
                      minlength="10" required>
               <span class="field__hint">Не короче 10 символов.</span>
             </div>
+            <div class="field" id="u-role-field">
+              <label for="u-role">Тип учётной записи</label>
+              <select id="u-role">
+                <option value="admin">Администратор</option>
+                <option value="promoter">Промоутер</option>
+              </select>
+            </div>
+            <div class="field" id="u-expiry-field" hidden>
+              <label for="u-expires">Срок действия</label>
+              <input id="u-expires" type="date">
+              <span class="field__hint">
+                Оставьте пустым для бессрочной учётной записи.
+              </span>
+            </div>
             <p class="form-error" id="add-user-error" role="alert" hidden></p>
             <div class="form-actions">
               <button class="btn btn--primary" id="add-user-submit" type="submit">Добавить</button>
@@ -281,7 +418,7 @@
 
         <div class="panel">
           <div class="panel__head">
-            <h2 class="panel__title">Список администраторов</h2>
+            <h2 class="panel__title" id="users-list-title">Пользователи</h2>
             <span class="muted small" id="users-count"></span>
           </div>
           <div class="users-list" id="users-list"></div>
@@ -469,6 +606,143 @@
       </div>
     </section>
 
+  <dialog id="door-link-dialog">
+    <h2>Доступ для охраны и персонала</h2>
+    <p class="auth__sub">
+      Ссылка открывает режим проверки гостей на телефоне: поиск, сканирование QR
+      и отметка входа. Подходит охране, барменам и персоналу VIP-зоны.
+      Не публикуйте её — она даёт доступ к гостевому списку мероприятия.
+    </p>
+    <div id="door-link-empty">
+      <p class="field__hint">Ссылка ещё не создана.</p>
+      <button class="btn btn--primary" id="door-link-create" type="button">
+        Создать ссылку
+      </button>
+    </div>
+    <div id="door-link-ready" class="stack" hidden>
+      <div class="field">
+        <label for="door-link-url">Ссылка для охраны или персонала</label>
+        <input id="door-link-url" type="text" readonly>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn--primary" id="door-link-copy" type="button">
+          Скопировать
+        </button>
+        <button class="btn" id="door-link-share" type="button">Поделиться</button>
+        <span class="spacer"></span>
+        <button class="btn" id="door-link-rotate" type="button">Обновить</button>
+        <button class="btn btn--danger" id="door-link-revoke" type="button">Отозвать</button>
+      </div>
+    </div>
+    <p class="form-error" id="door-link-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button class="btn btn--ghost" id="door-link-close" type="button">Закрыть</button>
+    </div>
+  </dialog>
+
+  <dialog id="guest-list-dialog">
+    <h2>Новый гостевой список</h2>
+    <p class="auth__sub">
+      Например, «Гости», «VIP» или список для конкретной зоны.
+    </p>
+    <form id="guest-list-form" class="stack" novalidate>
+      <div class="field">
+        <label for="guest-list-name">Название списка</label>
+        <input id="guest-list-name" type="text" maxlength="60" required
+               placeholder="Гости">
+      </div>
+      <p class="form-error" id="guest-list-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="btn btn--ghost" id="guest-list-cancel" type="button">Отмена</button>
+        <button class="btn btn--primary" type="submit">Создать</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="guest-edit-dialog">
+    <h2>Редактировать гостя</h2>
+    <p class="auth__sub">
+      Можно изменить имя, телефон и переместить гостя в другой список.
+    </p>
+    <form id="guest-edit-form" class="stack" novalidate>
+      <div class="field">
+        <label for="edit-guest-name">Имя гостя</label>
+        <input id="edit-guest-name" type="text" maxlength="120" required
+               autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="edit-guest-phone">Телефон</label>
+        <input id="edit-guest-phone" type="tel" maxlength="40"
+               autocomplete="off" inputmode="tel" placeholder="+7 …">
+      </div>
+      <div class="field">
+        <label for="edit-guest-list">Гостевой список</label>
+        <select id="edit-guest-list"></select>
+      </div>
+      <div class="field">
+        <label for="edit-guest-table">Стол</label>
+        <input id="edit-guest-table" type="text" maxlength="40"
+               autocomplete="off" placeholder="Стол 7">
+      </div>
+      <div class="field">
+        <label for="edit-guest-notes">Заметка</label>
+        <input id="edit-guest-notes" type="text" maxlength="500"
+               autocomplete="off" placeholder="Необязательно">
+      </div>
+      <p class="form-error" id="guest-edit-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="btn btn--ghost" id="guest-edit-cancel" type="button">Отмена</button>
+        <button class="btn btn--primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="registration-link-dialog">
+    <h2>Новая ссылка на саморегистрацию</h2>
+    <p class="auth__sub">
+      Гость заполнит имя и телефон, получит персональный QR и попадёт в выбранный список.
+    </p>
+    <form id="registration-link-form" class="stack" novalidate>
+      <div class="field">
+        <label for="registration-link-list">Гостевой список</label>
+        <select id="registration-link-list"></select>
+      </div>
+      <div class="field">
+        <label for="registration-link-comment">Комментарий</label>
+        <input id="registration-link-comment" type="text" maxlength="500"
+               autocomplete="off" placeholder="Например: для Telegram-канала">
+        <span class="field__hint">Виден только администраторам.</span>
+      </div>
+      <div class="field">
+        <label for="registration-link-expiry">Срок действия</label>
+        <select id="registration-link-expiry">
+          <option value="never">Бессрочно</option>
+          <option value="start+1" selected>Перестанет работать через 1 час после начала мероприятия</option>
+          <option value="start+2">Перестанет работать через 2 часа после начала мероприятия</option>
+          <option value="start+3">Перестанет работать через 3 часа после начала мероприятия</option>
+          <option value="start">Перестанет работать после начала мероприятия</option>
+          <option value="custom">Своя дата и время</option>
+        </select>
+      </div>
+      <div class="field" id="registration-link-expiry-custom" hidden>
+        <label for="registration-link-expires">Окончание регистрации</label>
+        <input id="registration-link-expires" type="datetime-local">
+        <span class="field__hint">Время в часовом поясе мероприятия.</span>
+      </div>
+      <div class="field">
+        <label for="registration-link-limit">Лимит регистраций</label>
+        <input id="registration-link-limit" type="number" min="1" max="100000"
+               inputmode="numeric" placeholder="Без ограничения">
+        <span class="field__hint">Оставьте пустым, если лимита нет.</span>
+      </div>
+      <p class="form-error" id="registration-link-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="btn btn--ghost" id="registration-link-cancel" type="button">Отмена</button>
+        <button class="btn btn--primary" type="submit">Создать ссылку</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="shift-dialog">
     <h2>Перенести мероприятие</h2>
     <p class="auth__sub">
@@ -538,6 +812,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=26"></script>
+  <script type="module" src="/assets/admin.js?v=43"></script>
 </body>
 </html>

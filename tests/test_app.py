@@ -197,6 +197,23 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(status, 201, data)
         return data["user"]
 
+    def create_promoter(self, username="promo", password="promo-password-1",
+                        expires_at=None, client=None):
+        agent = client or self.client
+        if client is None:
+            self.login()
+        payload = {
+            "username": username,
+            "password": password,
+            "isPromoter": True,
+        }
+        if expires_at:
+            payload["expiresAt"] = expires_at
+        status, _, data = agent.post(
+            "/api/admin/users", payload, csrf=agent.csrf)
+        self.assertEqual(status, 201, data)
+        return data["user"]
+
     def login_as(self, username, password):
         client = Client(self)
         status, _, data = client.post(
@@ -838,6 +855,713 @@ class LineUPTestCase(unittest.TestCase):
                 conn.execute("SELECT COUNT(*) FROM performances").fetchone()[0], 0)
         finally:
             conn.close()
+
+    def test_guest_search_is_case_insensitive_for_cyrillic(self):
+        event = self.create_event(title="GUEST SEARCH")
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Гости"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        list_id = data["list"]["id"]
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{list_id}/guests",
+            {"name": "Федот"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+
+        for query in ("федот", "Федот", "ФЕДОТ"):
+            status, _, data = self.client.get(
+                f"/api/admin/guest-lists/{list_id}/guests?q={query}")
+            self.assertEqual(status, 200, data)
+            self.assertEqual([item["name"] for item in data["guests"]],
+                             ["Федот"], query)
+
+    def test_door_link_scans_and_searches_guests(self):
+        self.create_admin("promo", "promo-password-1")
+        event = self.create_event(title="DOOR NIGHT")
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Гости", "promoterUsername": "promo"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        list_id = data["list"]["id"]
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{list_id}/guests",
+            {"name": "Федот", "phone": "+7 999 123-45-67",
+             "tableName": "7"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        guest = data["guest"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/door-link", {},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        path = data["link"]["path"]
+        door_token = path.rsplit("/", 1)[-1]
+
+        status, headers, _ = self.client.get(f"/door/{door_token}")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["content-type"])
+        self.assertIn("camera=(self)", headers["permissions-policy"])
+
+        status, headers, _ = self.client.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("camera=()", headers["permissions-policy"])
+
+        status, _, data = self.client.get(f"/api/door/{door_token}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["title"], "DOOR NIGHT")
+        self.assertEqual(data["stats"]["guestCount"], 1)
+        self.assertEqual(data["stats"]["checkedInCount"], 0)
+
+        for query in ("федот", "Федот", "ФЕДОТ", "4567", "999"):
+            status, _, data = self.client.get(
+                f"/api/door/{door_token}/search?q={query}")
+            self.assertEqual(status, 200, data)
+            self.assertEqual([item["name"] for item in data["guests"]],
+                             ["Федот"], query)
+            item = data["guests"][0]
+            self.assertEqual(item["phoneMasked"], "•••• 4567", query)
+            self.assertEqual(item["listName"], "Гости", query)
+            self.assertNotIn("phone", item)
+            self.assertNotIn("123-45-67",
+                             json.dumps(data, ensure_ascii=False), query)
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/scan",
+            {"code": f"https://nightevents.ru/g/{guest['shareToken']}"},
+            csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertFalse(data["already"])
+        self.assertEqual(data["guest"]["status"], "checked_in")
+        self.assertEqual(data["guest"]["phoneMasked"], "•••• 4567")
+        self.assertEqual(data["guest"]["listName"], "Гости")
+        self.assertNotIn("phone", data["guest"])
+        self.assertEqual(data["stats"]["checkedInCount"], 1)
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/scan",
+            {"code": guest["shareToken"]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["already"])
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/undo",
+            {"guestId": guest["id"]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["guest"]["status"], "invited")
+
+        # Промоутер не может управлять ссылкой для охраны.
+        promoter = self.login_as("promo", "promo-password-1")
+        status, _, data = promoter.get(
+            f"/api/admin/events/{event['id']}/door-link")
+        self.assertEqual(status, 403, data)
+
+        status, _, data = self.client.delete(
+            f"/api/admin/events/{event['id']}/door-link",
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, _ = self.client.get(f"/api/door/{door_token}")
+        self.assertEqual(status, 404)
+        status, _, _ = self.client.get("/api/door/not-a-real-token-12345")
+        self.assertEqual(status, 404)
+
+    def test_blacklist_guest_editing_and_door_warning(self):
+        event = self.create_event(title="BLACKLIST NIGHT")
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        self.assertEqual(status, 200, data)
+        blacklist = next(item for item in data["lists"] if item["isBlacklist"])
+        self.assertEqual(blacklist["name"], "Чёрный список")
+        self.assertEqual(len(data["lists"]), 1)
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "VIP посетители"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        vip = data["list"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{blacklist['id']}/guests",
+            {"name": "Плохой Гость", "phone": "+7 999 000-11-22"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        bad = data["guest"]
+        self.assertTrue(bad["listIsBlacklist"])
+        status, _, _ = self.client.get(f"/api/public/guests/{bad['shareToken']}")
+        self.assertEqual(status, 404)
+
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{vip['id']}/guests",
+            {"name": "Хороший Гость", "phone": "+7 999 000-11-22",
+             "tableName": "1"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        good = data["guest"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/door-link", {},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        door_token = data["link"]["path"].rsplit("/", 1)[-1]
+
+        status, _, data = self.client.get(
+            f"/api/door/{door_token}/search?q=Плохой")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(len(data["guests"]), 1)
+        self.assertTrue(data["guests"][0]["blacklisted"])
+        self.assertEqual(data["guests"][0]["listName"], "Чёрный список")
+        self.assertEqual(data["stats"]["guestCount"], 1)
+
+        # Обычный гость с тем же телефоном тоже подсвечивается в поиске.
+        status, _, data = self.client.get(
+            f"/api/door/{door_token}/search?q=Хороший")
+        self.assertEqual(status, 200, data)
+        good_card = next(
+            item for item in data["guests"] if item["name"] == "Хороший Гость")
+        self.assertFalse(good_card["blacklisted"])
+        self.assertEqual(good_card["blacklistMatch"]["name"], "Плохой Гость")
+
+        # Обычный гость с тем же телефоном блокируется при сканировании.
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/scan",
+            {"code": good["shareToken"]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["blacklisted"])
+        self.assertEqual(data["blacklistMatch"]["name"], "Плохой Гость")
+        self.assertEqual(data["guest"]["status"], "invited")
+
+        # QR из чёрного списка тоже не отмечает вход.
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/scan",
+            {"code": bad["shareToken"]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["blacklisted"])
+        self.assertEqual(data["guest"]["status"], "invited")
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/checkin",
+            {"guestId": bad["id"]}, csrf=None)
+        self.assertEqual(status, 403, data)
+        self.assertEqual(data["error"]["code"], "blacklisted")
+
+        # В чёрном списке нельзя отметить приход вручную из админки.
+        status, _, data = self.client.patch(
+            f"/api/admin/guests/{bad['id']}", {"status": "checked_in"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+        # Перемещение в чёрный список и обратно.
+        status, _, data = self.client.patch(
+            f"/api/admin/guests/{good['id']}", {"listId": blacklist["id"]},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["guest"]["listIsBlacklist"])
+        self.assertEqual(data["guest"]["status"], "invited")
+        status, _, _ = self.client.get(f"/api/public/guests/{good['shareToken']}")
+        self.assertEqual(status, 404)
+
+        status, _, data = self.client.patch(
+            f"/api/admin/guests/{good['id']}",
+            {"listId": vip["id"], "name": "Хороший Гость 2",
+             "phone": "+7 999 000-33-44"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["guest"]["name"], "Хороший Гость 2")
+        self.assertEqual(data["guest"]["phone"], "+7 999 000-33-44")
+        self.assertFalse(data["guest"]["listIsBlacklist"])
+        status, _, public = self.client.get(
+            f"/api/public/guests/{good['shareToken']}")
+        self.assertEqual(status, 200, public)
+        self.assertEqual(public["guest"]["name"], "Хороший Гость 2")
+
+        # Чёрный список нельзя удалить или переименовать.
+        status, _, data = self.client.patch(
+            f"/api/admin/guest-lists/{blacklist['id']}",
+            {"name": "Новый список"}, csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+        status, _, data = self.client.delete(
+            f"/api/admin/guest-lists/{blacklist['id']}",
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+    def test_promoter_suggestions_follow_creator(self):
+        helper = self.create_admin("helper", "helper-password-1")
+        helper_client = self.login_as("helper", "helper-password-1")
+        event = self.create_event_as(helper_client, title="SUGGEST NIGHT")
+
+        status, _, data = helper_client.post(
+            "/api/admin/users",
+            {"username": "own_promo", "password": "own-promo-pass-1",
+             "isPromoter": True},
+            csrf=helper_client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        own = data["user"]
+        other = self.create_promoter("other_promo", "other-promo-pass-1")
+
+        status, _, data = helper_client.get(
+            f"/api/admin/events/{event['id']}/promoters")
+        self.assertEqual(status, 200, data)
+        names = [item["username"] for item in data["promoters"]]
+        self.assertIn(own["username"], names)
+        self.assertNotIn(other["username"], names)
+
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/promoters")
+        self.assertEqual(status, 200, data)
+        names = [item["username"] for item in data["promoters"]]
+        self.assertIn(own["username"], names)
+        self.assertIn(other["username"], names)
+
+        status, _, data = helper_client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Гости"}, csrf=helper_client.csrf)
+        self.assertEqual(status, 201, data)
+        status, _, data = helper_client.post(
+            f"/api/admin/events/{event['id']}/promoters",
+            {"username": "own_promo", "listId": data["list"]["id"]},
+            csrf=helper_client.csrf)
+        self.assertEqual(status, 200, data)
+
+        promo_client = self.login_as("own_promo", "own-promo-pass-1")
+        status, _, data = promo_client.get(
+            f"/api/admin/events/{event['id']}/promoters")
+        self.assertEqual(status, 403, data)
+
+    def test_self_registration_links(self):
+        event = self.create_event(title="REGISTRATION NIGHT")
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        blacklist = next(item for item in data["lists"] if item["isBlacklist"])
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Посетители"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        guest_list = data["list"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": guest_list["id"], "comment": "Для Telegram-канала",
+             "maxRegistrations": 2, "expiryMode": "start+1"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        link = data["link"]
+        self.assertEqual(link["comment"], "Для Telegram-канала")
+        self.assertEqual(link["maxRegistrations"], 2)
+        self.assertEqual(link["registrationCount"], 0)
+        self.assertTrue(link["canRegister"])
+        self.assertTrue(link["path"].startswith("/r/"))
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": blacklist["id"], "expiryMode": "never"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": guest_list["id"], "expiryMode": "custom",
+             "expiresAtLocal": "2020-01-01T12:00"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+        status, _, public = self.client.get(link["path"].replace("/r/", "/api/public/registration/"))
+        self.assertEqual(status, 200, public)
+        self.assertTrue(public["canRegister"])
+        self.assertNotIn("comment", public)
+        self.assertEqual(public["event"]["title"], "REGISTRATION NIGHT")
+
+        for index, name in enumerate(("Первый Гость", "Второй Гость"), start=1):
+            status, _, data = self.client.post(
+                f"/api/public/registration/{link['token']}",
+                {"name": name, "phone": f"+7 999 100-00-0{index}"},
+                csrf=None)
+            self.assertEqual(status, 201, data)
+            self.assertEqual(data["guest"]["name"], name)
+            self.assertTrue(data["guest"]["shareToken"])
+
+        status, _, public = self.client.get(
+            f"/api/public/registration/{link['token']}")
+        self.assertEqual(status, 200, public)
+        self.assertFalse(public["canRegister"])
+        self.assertEqual(public["reason"], "limit")
+        self.assertEqual(public["registrationCount"], 2)
+
+        status, _, data = self.client.post(
+            f"/api/public/registration/{link['token']}",
+            {"name": "Третий Гость"}, csrf=None)
+        self.assertEqual(status, 410, data)
+        self.assertEqual(data["error"]["code"], "registration_closed")
+
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/registration-links")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(len(data["links"]), 1)
+        saved = data["links"][0]
+        self.assertEqual(saved["registrationCount"], 2)
+        self.assertFalse(saved["canRegister"])
+        self.assertEqual(saved["reason"], "limit")
+        self.assertEqual(saved["listName"], "Посетители")
+
+        # Регистрация попала в список как обычный гость с личным QR.
+        status, _, data = self.client.get(
+            f"/api/admin/guest-lists/{guest_list['id']}/guests")
+        self.assertEqual(status, 200, data)
+        names = [item["name"] for item in data["guests"]]
+        self.assertIn("Первый Гость", names)
+        self.assertIn("Второй Гость", names)
+        first = next(item for item in data["guests"]
+                     if item["name"] == "Первый Гость")
+        status, _, public_guest = self.client.get(
+            f"/api/public/guests/{first['shareToken']}")
+        self.assertEqual(status, 200, public_guest)
+        status, headers, _ = self.client.get(
+            f"/g/{first['shareToken']}/qr.png")
+        self.assertEqual(status, 200)
+        self.assertIn("image/png", headers["content-type"])
+
+        # Ссылка без лимита и с ручным закрытием/открытием.
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": guest_list["id"], "comment": "Бессрочная",
+             "expiryMode": "never"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        forever = data["link"]
+        self.assertIsNone(forever["maxRegistrations"])
+        self.assertIsNone(forever["expiresAt"])
+        self.assertTrue(forever["canRegister"])
+
+        status, _, data = self.client.patch(
+            f"/api/admin/registration-links/{forever['id']}",
+            {"isActive": False}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertFalse(data["link"]["canRegister"])
+        self.assertEqual(data["link"]["reason"], "closed")
+        status, _, data = self.client.patch(
+            f"/api/admin/registration-links/{forever['id']}",
+            {"isActive": True}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["link"]["canRegister"])
+
+        # Истёкшая ссылка закрыта, даже если флаг is_active включён.
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": guest_list["id"], "expiryMode": "start+2"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        expired = data["link"]
+        conn = db.connect()
+        try:
+            conn.execute(
+                "UPDATE guest_registration_links SET expires_at = '2020-01-01T00:00:00Z' "
+                "WHERE id = ?", (expired["id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        status, _, public = self.client.get(
+            f"/api/public/registration/{expired['token']}")
+        self.assertEqual(status, 200, public)
+        self.assertFalse(public["canRegister"])
+        self.assertEqual(public["reason"], "expired")
+        status, _, data = self.client.post(
+            f"/api/public/registration/{expired['token']}",
+            {"name": "Поздний Гость"}, csrf=None)
+        self.assertEqual(status, 410, data)
+
+        # Удаление ссылки: гости остаются, публичная ссылка исчезает.
+        status, _, data = self.client.delete(
+            f"/api/admin/registration-links/{forever['id']}",
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, _ = self.client.get(
+            f"/api/public/registration/{forever['token']}")
+        self.assertEqual(status, 404)
+        status, _, data = self.client.delete(
+            f"/api/admin/registration-links/{link['id']}",
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["registrations"], 2)
+        status, _, _ = self.client.get(
+            f"/api/public/registration/{link['token']}")
+        self.assertEqual(status, 404)
+        status, _, data = self.client.get(
+            f"/api/admin/guest-lists/{guest_list['id']}/guests")
+        names = [item["name"] for item in data["guests"]]
+        self.assertIn("Первый Гость", names)
+        self.assertIn("Второй Гость", names)
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/registration-links")
+        self.assertNotIn(link["id"], [item["id"] for item in data["links"]])
+        self.assertNotIn(forever["id"], [item["id"] for item in data["links"]])
+
+        # Промоутер не управляет ссылками.
+        promoter = self.create_promoter("reg_promo", "reg-promo-pass-1")
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/promoters",
+            {"username": promoter["username"], "listId": guest_list["id"]},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        promo_client = self.login_as("reg_promo", "reg-promo-pass-1")
+        status, _, data = promo_client.get(
+            f"/api/admin/events/{event['id']}/registration-links")
+        self.assertEqual(status, 403, data)
+        status, _, data = promo_client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": guest_list["id"], "expiryMode": "never"},
+            csrf=promo_client.csrf)
+        self.assertEqual(status, 403, data)
+
+    def test_multiple_promoters_on_lists(self):
+        event = self.create_event(title="PROMOTER NIGHT")
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        blacklist = next(item for item in data["lists"] if item["isBlacklist"])
+
+        lists = []
+        for name in ("Гости", "VIP"):
+            status, _, data = self.client.post(
+                f"/api/admin/events/{event['id']}/guest-lists",
+                {"name": name}, csrf=self.client.csrf)
+            self.assertEqual(status, 201, data)
+            lists.append(data["list"])
+
+        promo1 = self.create_promoter("promo_one", "promo-one-pass-1")
+        promo2 = self.create_promoter("promo_two", "promo-two-pass-1")
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/promoters",
+            {"username": "promo_one", "listId": lists[0]["id"]},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/promoters",
+            {"username": "promo_two"}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        by_name = {item["name"]: item for item in data["lists"]}
+        self.assertEqual(
+            [item["username"] for item in by_name["Гости"]["promoters"]],
+            ["promo_one", "promo_two"])
+        self.assertEqual(
+            [item["username"] for item in by_name["VIP"]["promoters"]],
+            ["promo_two"])
+        self.assertEqual(by_name["Чёрный список"]["promoters"], [])
+
+        client_one = self.login_as("promo_one", "promo-one-pass-1")
+        status, _, data = client_one.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        self.assertEqual(status, 200, data)
+        self.assertEqual([item["name"] for item in data["lists"]], ["Гости"])
+        status, _, data = client_one.get("/api/admin/events")
+        self.assertEqual(status, 200, data)
+        self.assertIn(event["id"], [item["id"] for item in data["events"]])
+
+        client_two = self.login_as("promo_two", "promo-two-pass-1")
+        status, _, data = client_two.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        self.assertEqual(status, 200, data)
+        self.assertEqual([item["name"] for item in data["lists"]], ["Гости", "VIP"])
+
+        # Нельзя назначить промоутера в чёрный список.
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/promoters",
+            {"username": "promo_one", "listId": blacklist["id"]},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+        # Убираем одного промоутера из списка и со всех списков.
+        status, _, data = self.client.delete(
+            f"/api/admin/guest-lists/{lists[0]['id']}/promoters/{promo2['id']}",
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, data = client_two.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        self.assertEqual([item["name"] for item in data["lists"]], ["VIP"])
+
+        status, _, data = self.client.delete(
+            f"/api/admin/events/{event['id']}/promoters/{promo2['id']}",
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, data = client_two.get("/api/admin/events")
+        self.assertEqual(status, 200, data)
+        self.assertNotIn(event["id"], [item["id"] for item in data["events"]])
+        self.create_admin("promo", "promo-password-1")
+        event = self.create_event(title="GUEST NIGHT")
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Гости", "promoterUsername": "promo"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        guest_list = data["list"]
+        self.assertEqual(guest_list["name"], "Гости")
+        self.assertEqual([item["username"] for item in guest_list["promoters"]],
+                         ["promo"])
+
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{guest_list['id']}/guests",
+            {
+                "name": "Иван Петров",
+                "phone": "+7 999 123-45-67",
+                "tableName": "Стол 7",
+                "notes": "День рождения",
+            },
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        guest = data["guest"]
+        self.assertEqual(guest["name"], "Иван Петров")
+        self.assertNotIn("plusOnes", guest)
+        self.assertEqual(guest["status"], "invited")
+        self.assertTrue(guest["shareToken"])
+        self.assertEqual(data["list"]["guestCount"], 1)
+        self.assertEqual(data["list"]["checkedInCount"], 0)
+
+        token = guest["shareToken"]
+        status, _, public = self.client.get(f"/api/public/guests/{token}")
+        self.assertEqual(status, 200, public)
+        self.assertEqual(public["guest"]["name"], "Иван Петров")
+        self.assertNotIn("plusOnes", public["guest"])
+        self.assertEqual(public["guest"]["tableName"], "Стол 7")
+        self.assertEqual(public["event"]["title"], "GUEST NIGHT")
+        self.assertNotIn("phone", public["guest"])
+        self.assertNotIn("notes", public["guest"])
+        self.assertNotIn("shareToken", public["guest"])
+
+        status, headers, _ = self.client.get(f"/g/{token}/qr.png")
+        self.assertEqual(status, 200)
+        self.assertIn("image/png", headers["content-type"])
+        self.assertTrue(self.client.last_body.startswith(b"\x89PNG\r\n\x1a\n"))
+        status, headers, _ = self.client.get(f"/g/{token}")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["content-type"])
+
+        status, _, data = self.client.patch(
+            f"/api/admin/guests/{guest['id']}",
+            {"status": "checked_in"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["guest"]["status"], "checked_in")
+        self.assertIsNotNone(data["guest"]["checkedInAt"])
+        self.assertEqual(data["list"]["checkedInCount"], 1)
+        status, _, public = self.client.get(f"/api/public/guests/{token}")
+        self.assertEqual(public["guest"]["status"], "checked_in")
+
+        status, _, data = self.client.patch(
+            f"/api/admin/guests/{guest['id']}",
+            {"status": "invited"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 200, data)
+        self.assertIsNone(data["guest"]["checkedInAt"])
+
+        promoter = self.login_as("promo", "promo-password-1")
+        status, _, data = promoter.get("/api/admin/events")
+        self.assertEqual(status, 200, data)
+        promoted = next(item for item in data["events"] if item["id"] == event["id"])
+        self.assertEqual(promoted["guestRole"], "promoter")
+
+        status, _, data = promoter.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        self.assertEqual(status, 200, data)
+        self.assertEqual([item["id"] for item in data["lists"]], [guest_list["id"]])
+
+        status, _, data = promoter.post(
+            f"/api/admin/guest-lists/{guest_list['id']}/guests",
+            {"name": "Гость промоутера"},
+            csrf=promoter.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        self.assertEqual(data["guest"]["name"], "Гость промоутера")
+
+        # Промоутер не может создавать и удалять списки.
+        status, _, data = promoter.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Чужой список"},
+            csrf=promoter.csrf,
+        )
+        self.assertEqual(status, 403, data)
+        status, _, data = promoter.delete(
+            f"/api/admin/guest-lists/{guest_list['id']}", csrf=promoter.csrf)
+        self.assertEqual(status, 403, data)
+
+        # Удаление мероприятия удаляет списки и гостей: ссылка перестаёт работать.
+        status, _, _ = self.client.delete(
+            f"/api/admin/events/{event['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        status, _, _ = self.client.get(f"/api/public/guests/{token}")
+        self.assertEqual(status, 404)
+
+    def test_guest_list_validation_and_public_visibility(self):
+        event = self.create_event(title="GUEST VALIDATION")
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Гости"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        list_id = data["list"]["id"]
+
+        bad_guests = [
+            {"name": ""},
+            {"name": "x", "phone": 42},
+        ]
+        for payload in bad_guests:
+            status, _, data = self.client.post(
+                f"/api/admin/guest-lists/{list_id}/guests", payload,
+                csrf=self.client.csrf)
+            self.assertEqual(status, 400, (payload, data))
+
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{list_id}/guests",
+            {"name": "Гость"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        guest = data["guest"]
+
+        # Черновик не отдаёт приглашение публично.
+        draft = self.create_event(title="DRAFT GUEST", published=False)
+        status, _, data = self.client.post(
+            f"/api/admin/events/{draft['id']}/guest-lists",
+            {"name": "Гости"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{data['list']['id']}/guests",
+            {"name": "Draft"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        status, _, _ = self.client.get(
+            f"/api/public/guests/{data['guest']['shareToken']}")
+        self.assertEqual(status, 404)
+
+        # Чужой администратор не видит список.
+        self.create_admin("other", "other-password-1")
+        other = self.login_as("other", "other-password-1")
+        status, _, data = other.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        self.assertEqual(status, 404, data)
+        status, _, data = other.get(
+            f"/api/admin/guest-lists/{list_id}/guests")
+        self.assertEqual(status, 404, data)
+
+        # Неверный токен и неизвестный список.
+        status, _, _ = self.client.get("/api/public/guests/not-a-real-token-12345")
+        self.assertEqual(status, 404)
+        status, _, data = self.client.delete(
+            f"/api/admin/guests/{guest['id']}", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, _ = self.client.get(
+            f"/api/public/guests/{guest['shareToken']}")
+        self.assertEqual(status, 404)
+
+        status, _, data = self.client.delete(
+            f"/api/admin/guest-lists/{list_id}", csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, _ = self.client.get(
+            f"/api/admin/guest-lists/{list_id}/guests")
+        self.assertEqual(status, 404)
 
     def test_event_qr_is_generated_on_demand(self):
         event = self.create_event(title="QR NIGHT")
@@ -1759,6 +2483,7 @@ class LineUPTestCase(unittest.TestCase):
     def test_super_can_manage_admins(self):
         helper = self.create_admin()
         self.assertFalse(helper["isSuper"])
+        self.assertFalse(helper["isPromoter"])
 
         status, _, data = self.client.get("/api/admin/users")
         self.assertEqual(status, 200)
@@ -1782,21 +2507,123 @@ class LineUPTestCase(unittest.TestCase):
         status, _, _ = helper_client.get("/api/admin/events")
         self.assertEqual(status, 401)
 
-    def test_regular_admin_cannot_manage_admins(self):
-        helper = self.create_admin()
-        client = self.login_as("helper", "helper-password-1")
-        requests = [
-            ("GET", "/api/admin/users", None),
-            ("POST", "/api/admin/users",
-             {"username": "third", "password": "third-password-3"}),
-            ("PATCH", f"/api/admin/users/{helper['id']}",
-             {"password": "third-password-3"}),
-            ("DELETE", f"/api/admin/users/{helper['id']}", None),
-        ]
-        for method, path, body in requests:
-            status, _, data = client.request(method, path, body, csrf=client.csrf)
-            self.assertEqual(status, 403, (method, path, data))
-            self.assertEqual(data["error"]["code"], "forbidden")
+    def test_regular_admin_manages_only_own_promoters(self):
+        helper = self.create_admin("helper", "helper-password-1")
+        other = self.create_admin("other", "other-password-1")
+        helper_client = self.login_as("helper", "helper-password-1")
+
+        status, _, data = helper_client.get("/api/admin/users")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["users"], [])
+
+        # Обычный администратор создаёт только промоутера, даже если просит админа.
+        status, _, data = helper_client.post(
+            "/api/admin/users",
+            {"username": "promo1", "password": "promo-password-1",
+             "isPromoter": False, "expiresAt": "2030-12-31"},
+            csrf=helper_client.csrf,
+        )
+        self.assertEqual(status, 201, data)
+        promoter = data["user"]
+        self.assertTrue(promoter["isPromoter"])
+        self.assertFalse(promoter["isSuper"])
+        self.assertEqual(promoter["createdByUsername"], "helper")
+        self.assertEqual(promoter["expiresAt"], "2030-12-31")
+
+        # Главный видит метку промоутера и автора.
+        status, _, data = self.client.get("/api/admin/users")
+        self.assertEqual(status, 200, data)
+        seen = next(item for item in data["users"]
+                    if item["id"] == promoter["id"])
+        self.assertTrue(seen["isPromoter"])
+        self.assertEqual(seen["createdByUsername"], "helper")
+
+        # Другой админ не видит и не может удалить чужого промоутера.
+        other_client = self.login_as("other", "other-password-1")
+        status, _, data = other_client.get("/api/admin/users")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["users"], [])
+        status, _, data = other_client.delete(
+            f"/api/admin/users/{promoter['id']}", csrf=other_client.csrf)
+        self.assertEqual(status, 403, data)
+        self.assertEqual(data["error"]["code"], "forbidden")
+
+        # Создатель может сменить пароль и удалить своего промоутера.
+        status, _, data = helper_client.patch(
+            f"/api/admin/users/{promoter['id']}",
+            {"password": "promo-password-2"}, csrf=helper_client.csrf)
+        self.assertEqual(status, 200, data)
+        status, _, data = helper_client.delete(
+            f"/api/admin/users/{promoter['id']}", csrf=helper_client.csrf)
+        self.assertEqual(status, 200, data)
+
+        # Чужого администратора обычный админ не трогает.
+        status, _, data = helper_client.patch(
+            f"/api/admin/users/{other['id']}",
+            {"password": "other-password-2"}, csrf=helper_client.csrf)
+        self.assertEqual(status, 403, data)
+        status, _, data = helper_client.delete(
+            f"/api/admin/users/{other['id']}", csrf=helper_client.csrf)
+        self.assertEqual(status, 403, data)
+
+    def test_promoter_expiry_and_limited_access(self):
+        self.login()
+        promoter = self.create_promoter(
+            "expiring", "expiring-password-1", expires_at="2030-01-01")
+        self.assertTrue(promoter["isPromoter"])
+        client = self.login_as("expiring", "expiring-password-1")
+        status, _, data = client.get("/api/admin/events")
+        self.assertEqual(status, 200, data)
+
+        # Промоутер не управляет пользователями и не создаёт мероприятия.
+        status, _, data = client.get("/api/admin/users")
+        self.assertEqual(status, 403, data)
+        status, _, data = client.post(
+            "/api/admin/users",
+            {"username": "another", "password": "another-password-1"},
+            csrf=client.csrf,
+        )
+        self.assertEqual(status, 403, data)
+        status, _, data = client.post(
+            "/api/admin/events", {}, csrf=client.csrf)
+        self.assertEqual(status, 403, data)
+
+        # Просроченная дата не принимается при создании.
+        status, _, data = self.client.post(
+            "/api/admin/users",
+            {"username": "past", "password": "past-password-1",
+             "isPromoter": True, "expiresAt": "2020-01-01"},
+            csrf=self.client.csrf,
+        )
+        self.assertEqual(status, 400, data)
+
+        # Срок действия проверяется и при активной сессии, и при входе.
+        conn = db.connect()
+        try:
+            conn.execute(
+                "UPDATE users SET expires_at = '2020-01-01' WHERE id = ?",
+                (promoter["id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        status, _, _ = client.get("/api/admin/events")
+        self.assertEqual(status, 401)
+        conn = db.connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE id = ?", (promoter["id"],)
+            ).fetchone()
+            self.assertIsNone(row)
+        finally:
+            conn.close()
+        status, _, data = self.client.post(
+            "/api/admin/login",
+            {"username": "expiring", "password": "expiring-password-1"})
+        self.assertEqual(status, 401, data)
+        self.assertEqual(data["error"]["code"], "invalid_credentials")
+        status, _, data = self.client.get("/api/admin/users")
+        self.assertNotIn("expiring",
+                         [item["username"] for item in data["users"]])
 
     def test_super_account_is_protected(self):
         self.login()

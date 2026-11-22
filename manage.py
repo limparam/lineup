@@ -170,6 +170,7 @@ def cmd_seed_demo(args) -> int:
                 ),
             )
             event_id = int(cur.lastrowid)
+            db.ensure_blacklist(conn, event_id, owner_id)
             hall1 = _add_hall(conn, event_id, "Зал 1", 1)
             hall2 = _add_hall(conn, event_id, "Зал 2", 2)
             _add_perf(conn, hall1, "DJ Vik", start, 60)
@@ -198,6 +199,7 @@ def cmd_seed_demo(args) -> int:
                 ),
             )
             event_id = int(cur.lastrowid)
+            db.ensure_blacklist(conn, event_id, owner_id)
             hall1 = _add_hall(conn, event_id, "Зал 1", 1)
             hall2 = _add_hall(conn, event_id, "Зал 2", 2)
             base = timeutil.parse_local("2027-11-04T20:00", tz)

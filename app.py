@@ -15,9 +15,10 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import sqlite3
 import time
-from datetime import timedelta
+from datetime import date, timedelta
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, unquote
@@ -126,6 +127,7 @@ REASONS = {
     200: "OK", 201: "Created", 204: "No Content", 304: "Not Modified",
     400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
     404: "Not Found", 405: "Method Not Allowed", 409: "Conflict",
+    410: "Gone",
     413: "Payload Too Large", 415: "Unsupported Media Type",
     429: "Too Many Requests", 500: "Internal Server Error",
 }
@@ -389,6 +391,9 @@ MAX_SITE_LINKS = 8
 SITE_LOGO_KEY = "logo_png"
 SITE_COPYRIGHT_KEY = "copyright_text"
 SITE_THEME_KEY = "theme"
+MAX_GUEST_LISTS = 20
+MAX_GUESTS_PER_LIST = 5000
+GUEST_STATUSES = ("invited", "checked_in")
 # 180 КБ в base64 занимают меньше 256 КБ, лимита тела запроса.
 MAX_LOGO_BYTES = 180 * 1024
 MAX_LOGO_SIDE = 5000
@@ -796,7 +801,9 @@ def _session_of(req: Request):
     conn = db.connect()
     try:
         row = conn.execute(
-            "SELECT s.*, u.username, u.is_super FROM sessions s "
+            "SELECT s.*, u.username, u.is_super, u.is_promoter, "
+            "u.expires_at AS account_expires_at "
+            "FROM sessions s "
             "JOIN users u ON u.id = s.user_id "
             "WHERE s.token_hash = ?", (security.token_hash(token),)
         ).fetchone()
@@ -804,6 +811,10 @@ def _session_of(req: Request):
             return None
         if int(row["expires_at"]) <= int(time.time()):
             conn.execute("DELETE FROM sessions WHERE token_hash = ?", (row["token_hash"],))
+            conn.commit()
+            return None
+        if row["account_expires_at"] and row["account_expires_at"] < timeutil.iso_now()[:10]:
+            conn.execute("DELETE FROM users WHERE id = ?", (row["user_id"],))
             conn.commit()
             return None
         return row
@@ -1095,6 +1106,272 @@ def api_public_site(req):
         conn.close()
 
 
+@route(r"/r/([A-Za-z0-9_-]{16,80})")
+def page_registration(req, token):
+    return _serve_static(req, "registration.html", cache="no-cache")
+
+
+@route(r"/api/public/registration/([A-Za-z0-9_-]{16,80})")
+def api_public_registration_info(req, token):
+    conn = db.connect()
+    try:
+        row = _registration_link_by_token(conn, token)
+        state = _registration_link_state(conn, row)
+        return json_response({
+            "event": {
+                "title": row["event_title"],
+                "startsAt": row["event_starts"],
+                "endsAt": row["event_ends"],
+                "timezone": row["event_timezone"],
+            },
+            "canRegister": state["canRegister"],
+            "reason": state["reason"],
+            "message": (_registration_closed_message(state["reason"])
+                        if state["reason"] else ""),
+            "registrationCount": state["registrationCount"],
+            "maxRegistrations": state["maxRegistrations"],
+            "remaining": state["remaining"],
+            "expiresAt": row["expires_at"],
+            "serverNow": timeutil.iso_now(),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/public/registration/([A-Za-z0-9_-]{16,80})",
+       methods=("POST",))
+def api_public_registration(req, token):
+    data = req.json()
+    raw_name = data.get("name")
+    raw_phone = data.get("phone")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise APIError(400, "validation", "Укажите имя.")
+    name = raw_name.strip()
+    if len(name) > 120:
+        raise APIError(400, "validation", "Слишком длинное имя.")
+    if raw_phone is None:
+        raw_phone = ""
+    if not isinstance(raw_phone, str):
+        raise APIError(400, "validation", "Телефон должен быть строкой.")
+    phone = raw_phone.strip()
+    if len(phone) > 40:
+        raise APIError(400, "validation", "Слишком длинный телефон.")
+
+    conn = db.connect()
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = _registration_link_by_token(conn, token)
+            state = _registration_link_state(conn, row)
+            if not state["canRegister"]:
+                raise APIError(
+                    410, "registration_closed",
+                    _registration_closed_message(state["reason"]),
+                )
+            guest_token = _new_guest_token(conn)
+            now = timeutil.iso_now()
+            cur = conn.execute(
+                "INSERT INTO guests (list_id, event_id, name, phone, table_name, "
+                "notes, status, share_token, created_by, registration_link_id, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, '', 'Саморегистрация', 'invited', ?, NULL, ?, ?, ?)",
+                (row["list_id"], row["event_id"], name, phone, guest_token,
+                 row["id"], now, now),
+            )
+            limit = state["maxRegistrations"]
+            if limit is not None and state["registrationCount"] + 1 >= limit:
+                conn.execute(
+                    "UPDATE guest_registration_links SET is_active = 0 WHERE id = ?",
+                    (row["id"],),
+                )
+            _audit(conn, {"user_id": None, "username": "registration"},
+                   "guest.registration", entity="guest",
+                   entity_id=int(cur.lastrowid), event_id=row["event_id"],
+                   detail=f"{row['event_title']} · {row['list_name']} · {name}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return json_response({
+            "guest": {"name": name, "shareToken": guest_token},
+            "event": {"title": row["event_title"]},
+        }, 201)
+    finally:
+        conn.close()
+
+
+@route(r"/g/([A-Za-z0-9_-]{16,80})")
+def page_guest(req, token):
+    return _serve_static(req, "guest.html", cache="no-cache")
+
+
+@route(r"/api/public/guests/([A-Za-z0-9_-]{16,80})")
+def api_public_guest(req, token):
+    conn = db.connect()
+    try:
+        row = _public_guest_row(conn, token)
+        return json_response(_guest_public_json(row))
+    finally:
+        conn.close()
+
+
+@route(r"/g/([A-Za-z0-9_-]{16,80})/qr\.png")
+def guest_qr(req, token):
+    conn = db.connect()
+    try:
+        _public_guest_row(conn, token)
+        url = f"{req.scheme}://{req.host}/g/{token}"
+        qr = segno.make(url, error="m")
+        buffer = io.BytesIO()
+        qr.save(buffer, kind="png", scale=24, border=4)
+        return Response(
+            buffer.getvalue(), 200, content_type="image/png",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+    finally:
+        conn.close()
+
+
+@route(r"/door/([A-Za-z0-9_-]{16,80})")
+def page_door(req, token):
+    resp = _serve_static(req, "door.html", cache="no-cache")
+    resp.headers["Permissions-Policy"] = (
+        "geolocation=(), microphone=(), camera=(self), payment=()")
+    return resp
+
+
+@route(r"/api/door/([A-Za-z0-9_-]{16,80})")
+def api_door_event(req, token):
+    conn = db.connect()
+    try:
+        row = _door_link_row(conn, token)
+        return json_response(_door_event_json(conn, row))
+    finally:
+        conn.close()
+
+
+@route(r"/api/door/([A-Za-z0-9_-]{16,80})/search")
+def api_door_search(req, token):
+    conn = db.connect()
+    try:
+        row = _door_link_row(conn, token)
+        query = (parse_qs(req.query).get("q") or [""])[0].strip()[:80]
+        if not query:
+            return json_response({"guests": [], "stats": _door_event_stats(
+                conn, row["link_event_id"])})
+        clause, args = _guest_search_clause(query, "g.")
+        guests = conn.execute(
+            "SELECT g.*, gl.name AS list_name, gl.is_blacklist FROM guests g "
+            "JOIN guest_lists gl ON gl.id = g.list_id "
+            "WHERE g.event_id = ?" + clause +
+            " ORDER BY CASE g.status WHEN 'checked_in' THEN 1 ELSE 0 END, "
+            "g.name COLLATE NOCASE LIMIT 30",
+            [row["link_event_id"], *args],
+        ).fetchall()
+        payload = []
+        for guest in guests:
+            item = _door_guest_json(guest)
+            if not item["blacklisted"]:
+                match = _blacklist_match(conn, row["link_event_id"], guest)
+                if match:
+                    item["blacklistMatch"] = _door_guest_json(match)
+            payload.append(item)
+        return json_response({
+            "guests": payload,
+            "stats": _door_event_stats(conn, row["link_event_id"]),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/door/([A-Za-z0-9_-]{16,80})/scan", methods=("POST",))
+def api_door_scan(req, token):
+    data = req.json()
+    raw = data.get("code")
+    if not isinstance(raw, str) or not raw.strip():
+        raise APIError(400, "validation", "Передайте QR-код гостя.")
+    raw = raw.strip()
+    if len(raw) > 500:
+        raise APIError(400, "validation", "Слишком длинный QR-код.")
+    match = re.search(r"/g/([A-Za-z0-9_-]{16,80})", raw)
+    guest_token = match.group(1) if match else raw
+    conn = db.connect()
+    try:
+        door = _door_link_row(conn, token)
+        guest = conn.execute(
+            "SELECT g.*, gl.name AS list_name, gl.is_blacklist FROM guests g "
+            "JOIN guest_lists gl ON gl.id = g.list_id "
+            "WHERE g.share_token = ? AND g.event_id = ?",
+            (guest_token, door["link_event_id"]),
+        ).fetchone()
+        if not guest:
+            raise APIError(404, "not_found", "Гость не найден.")
+        match = _blacklist_match(conn, door["link_event_id"], guest)
+        if match:
+            return json_response({
+                "guest": _door_guest_json(guest),
+                "blacklisted": True,
+                "blacklistMatch": _door_guest_json(match),
+                "already": guest["status"] == "checked_in",
+                "stats": _door_event_stats(conn, door["link_event_id"]),
+            })
+        already = guest["status"] == "checked_in"
+        checked = _door_checkin(conn, door, guest)
+        updated = _door_guest_row(conn, door["link_event_id"], guest["id"])
+        return json_response({
+            "guest": _door_guest_json(updated),
+            "already": already or not checked,
+            "stats": _door_event_stats(conn, door["link_event_id"]),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/door/([A-Za-z0-9_-]{16,80})/checkin", methods=("POST",))
+def api_door_checkin(req, token):
+    data = req.json()
+    guest_id = data.get("guestId")
+    if isinstance(guest_id, bool) or not isinstance(guest_id, int):
+        raise APIError(400, "validation", "Укажите гостя.")
+    conn = db.connect()
+    try:
+        door = _door_link_row(conn, token)
+        guest = _door_guest_row(conn, door["link_event_id"], guest_id)
+        if _blacklist_match(conn, door["link_event_id"], guest):
+            raise APIError(403, "blacklisted",
+                           "Гость в чёрном списке. Вход запрещён.")
+        already = guest["status"] == "checked_in"
+        checked = _door_checkin(conn, door, guest)
+        updated = _door_guest_row(conn, door["link_event_id"], guest["id"])
+        return json_response({
+            "guest": _door_guest_json(updated),
+            "already": already or not checked,
+            "stats": _door_event_stats(conn, door["link_event_id"]),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/door/([A-Za-z0-9_-]{16,80})/undo", methods=("POST",))
+def api_door_undo(req, token):
+    data = req.json()
+    guest_id = data.get("guestId")
+    if isinstance(guest_id, bool) or not isinstance(guest_id, int):
+        raise APIError(400, "validation", "Укажите гостя.")
+    conn = db.connect()
+    try:
+        door = _door_link_row(conn, token)
+        guest = _door_guest_row(conn, door["link_event_id"], guest_id)
+        _door_undo(conn, door, guest)
+        updated = _door_guest_row(conn, door["link_event_id"], guest["id"])
+        return json_response({
+            "guest": _door_guest_json(updated),
+            "stats": _door_event_stats(conn, door["link_event_id"]),
+        })
+    finally:
+        conn.close()
+
+
 @route(r"/api/public/events/([a-z0-9-]{1,80})")
 def api_public_event(req, slug):
     conn = db.connect()
@@ -1312,8 +1589,13 @@ def api_admin_session(req):
             {"authenticated": False, "setupRequired": setup}, 401)
     return json_response({
         "authenticated": True,
-        "user": {"username": session["username"],
-                 "isSuper": bool(session["is_super"])},
+        "user": {
+            "id": session["user_id"],
+            "username": session["username"],
+            "isSuper": bool(session["is_super"]),
+            "isPromoter": bool(session["is_promoter"]),
+            "expiresAt": session["account_expires_at"],
+        },
         "csrfToken": session["csrf"],
         "expiresAt": int(session["expires_at"]),
     })
@@ -1331,6 +1613,11 @@ def api_admin_login(req):
 
     conn = db.connect()
     try:
+        purged = db.purge_expired_promoters(
+            conn, timeutil.iso_now()[:10], keep_username=username)
+        if purged:
+            conn.commit()
+            log.info("Удалены просроченные промоутеры: %s", ", ".join(purged))
         if _rate_limited(conn, req.remote_addr, username):
             raise APIError(
                 429, "too_many_attempts",
@@ -1355,6 +1642,15 @@ def api_admin_login(req):
             conn.commit()
             raise APIError(401, "invalid_credentials", "Неверный логин или пароль.")
 
+        if row["expires_at"] and row["expires_at"] < timeutil.iso_now()[:10]:
+            conn.execute("DELETE FROM users WHERE id = ?", (row["id"],))
+            conn.commit()
+            log.info("Удалён просроченный промоутер «%s»", row["username"])
+            raise APIError(
+                403, "expired",
+                "Срок действия учётной записи истёк. Учётная запись удалена.",
+            )
+
         token = security.new_token()
         csrf = security.new_token()
         now = int(time.time())
@@ -1374,8 +1670,13 @@ def api_admin_login(req):
         log.info("Вход в админку: %s (%s)", row["username"], req.remote_addr)
         resp = json_response({
             "authenticated": True,
-            "user": {"username": row["username"],
-                     "isSuper": bool(row["is_super"])},
+            "user": {
+                "id": row["id"],
+                "username": row["username"],
+                "isSuper": bool(row["is_super"]),
+                "isPromoter": bool(row["is_promoter"]),
+                "expiresAt": row["expires_at"],
+            },
             "csrfToken": csrf,
             "expiresAt": expires,
         })
@@ -1449,30 +1750,71 @@ def _password_hash(user_id: int) -> str:
 # Админка: администраторы (только главный)
 # --------------------------------------------------------------------------
 
+def _normalize_expiry(raw):
+    if raw is None or raw == "":
+        return None
+    try:
+        parsed = date.fromisoformat(str(raw).strip())
+    except ValueError:
+        raise APIError(400, "validation", "Некорректная дата окончания.") from None
+    if parsed.isoformat() < timeutil.iso_now()[:10]:
+        raise APIError(400, "validation", "Дата окончания уже прошла.")
+    return parsed.isoformat()
+
+
 def _user_json(row) -> dict:
+    keys = row.keys()
+    expires = row["expires_at"] if "expires_at" in keys else None
+    creator = row["created_by_username"] if "created_by_username" in keys else ""
     return {
         "id": row["id"],
         "username": row["username"],
         "isSuper": bool(row["is_super"]),
+        "isPromoter": bool(row["is_promoter"]),
+        "createdBy": row["created_by"] if "created_by" in keys else None,
+        "createdByUsername": creator or "",
+        "expiresAt": expires,
+        "expired": bool(expires and expires < timeutil.iso_now()[:10]),
         "createdAt": row["created_at"],
     }
 
 
 def _user_row(conn, user_id: int):
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    row = conn.execute(
+        "SELECT u.*, c.username AS created_by_username FROM users u "
+        "LEFT JOIN users c ON c.id = u.created_by WHERE u.id = ?",
+        (user_id,),
+    ).fetchone()
     if not row:
-        raise APIError(404, "not_found", "Администратор не найден.")
+        raise APIError(404, "not_found", "Пользователь не найден.")
     return row
 
 
 @route(r"/api/admin/users")
 def api_admin_users(req):
-    _require_super(req, csrf=False)
+    session = _require_admin(req, csrf=False)
+    if session["is_promoter"]:
+        raise APIError(403, "forbidden",
+                       "Промоутеру недоступно управление пользователями.")
     conn = db.connect()
     try:
-        rows = conn.execute(
-            "SELECT * FROM users ORDER BY id"
-        ).fetchall()
+        purged = db.purge_expired_promoters(conn, timeutil.iso_now()[:10])
+        if purged:
+            conn.commit()
+        base = (
+            "SELECT u.*, c.username AS created_by_username FROM users u "
+            "LEFT JOIN users c ON c.id = u.created_by "
+        )
+        if session["is_super"]:
+            rows = conn.execute(
+                base + "ORDER BY u.is_super DESC, u.is_promoter DESC, u.id"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                base + "WHERE u.is_promoter = 1 AND u.created_by = ? "
+                "ORDER BY u.id",
+                (session["user_id"],),
+            ).fetchall()
         return json_response({"users": [_user_json(row) for row in rows]})
     finally:
         conn.close()
@@ -1480,7 +1822,10 @@ def api_admin_users(req):
 
 @route(r"/api/admin/users", methods=("POST",))
 def api_admin_user_create(req):
-    session = _require_super(req)
+    session = _require_admin(req)
+    if session["is_promoter"]:
+        raise APIError(403, "forbidden",
+                       "Промоутер не может создавать учётные записи.")
     data = req.json()
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
@@ -1492,39 +1837,62 @@ def api_admin_user_create(req):
     if problem:
         raise APIError(400, "validation", problem)
 
+    is_promoter = bool(data.get("isPromoter"))
+    if not session["is_super"]:
+        is_promoter = True
+    expires_at = _normalize_expiry(data.get("expiresAt")) if is_promoter else None
+
     conn = db.connect()
     try:
+        purged = db.purge_expired_promoters(conn, timeutil.iso_now()[:10])
+        if purged:
+            conn.commit()
         exists = conn.execute(
             "SELECT 1 FROM users WHERE username = ? COLLATE NOCASE", (username,)
         ).fetchone()
         if exists:
             raise APIError(409, "conflict",
-                           f"Администратор «{username}» уже существует.")
+                           f"Пользователь «{username}» уже существует.")
         cur = conn.execute(
-            "INSERT INTO users (username, password_hash, is_super, created_at) "
-            "VALUES (?, ?, 0, ?)",
-            (username, security.hash_password(password), timeutil.iso_now()),
+            "INSERT INTO users (username, password_hash, is_super, is_promoter, "
+            "created_by, expires_at, created_at) "
+            "VALUES (?, ?, 0, ?, ?, ?, ?)",
+            (username, security.hash_password(password), 1 if is_promoter else 0,
+             session["user_id"] if is_promoter else None, expires_at,
+             timeutil.iso_now()),
         )
+        kind = "промоутер" if is_promoter else "администратор"
         _audit(conn, session, "user.create", entity="user",
-               entity_id=int(cur.lastrowid), detail=username)
+               entity_id=int(cur.lastrowid), detail=f"{username} · {kind}")
         conn.commit()
         row = _user_row(conn, int(cur.lastrowid))
     finally:
         conn.close()
-    log.info("Добавлен администратор «%s»", username)
+    log.info("Добавлен %s «%s» (кем: %s)", kind, username, session["username"])
     return json_response({"user": _user_json(row)}, 201)
 
 
 @route(r"/api/admin/users/(\d{1,12})", methods=("PATCH", "PUT"))
 def api_admin_user_update(req, user_id):
-    session = _require_super(req)
+    session = _require_admin(req)
+    if session["is_promoter"]:
+        raise APIError(403, "forbidden",
+                       "Промоутер не может менять пароли пользователей.")
     data = req.json()
     conn = db.connect()
     try:
+        purged = db.purge_expired_promoters(conn, timeutil.iso_now()[:10])
+        if purged:
+            conn.commit()
         row = _user_row(conn, int(user_id))
         if row["is_super"]:
             raise APIError(403, "forbidden",
                            "Пароль главного администратора меняется в разделе «Пароль».")
+        if not session["is_super"] and (
+                not row["is_promoter"]
+                or row["created_by"] != session["user_id"]):
+            raise APIError(403, "forbidden",
+                           "Можно менять пароль только своим промоутерам.")
         password = str(data.get("password") or "")
         problem = security.validate_password(password)
         if problem:
@@ -1539,14 +1907,17 @@ def api_admin_user_update(req, user_id):
         conn.commit()
     finally:
         conn.close()
-    log.info("Пароль администратора «%s» изменён (кем: %s)",
+    log.info("Пароль пользователя «%s» изменён (кем: %s)",
              row["username"], session["username"])
     return json_response({"ok": True, "user": _user_json(row)})
 
 
 @route(r"/api/admin/users/(\d{1,12})", methods=("DELETE",))
 def api_admin_user_delete(req, user_id):
-    session = _require_super(req)
+    session = _require_admin(req)
+    if session["is_promoter"]:
+        raise APIError(403, "forbidden",
+                       "Промоутер не может удалять учётные записи.")
     conn = db.connect()
     try:
         row = _user_row(conn, int(user_id))
@@ -1555,22 +1926,28 @@ def api_admin_user_delete(req, user_id):
                            "Главного администратора удалить нельзя.")
         if row["id"] == session["user_id"]:
             raise APIError(403, "forbidden", "Нельзя удалить самого себя.")
+        if not session["is_super"] and (
+                not row["is_promoter"]
+                or row["created_by"] != session["user_id"]):
+            raise APIError(403, "forbidden",
+                           "Можно удалять только промоутеров, которых вы добавили.")
         moved = conn.execute(
             "SELECT COUNT(*) FROM events WHERE owner_id = ?", (row["id"],)
         ).fetchone()[0]
-        # Мероприятия удалённого админа переходят действующему главному.
+        # Мероприятия удалённого пользователя переходят действующему администратору.
         conn.execute(
             "UPDATE events SET owner_id = ? WHERE owner_id = ?",
             (session["user_id"], row["id"]),
         )
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        kind = "промоутера" if row["is_promoter"] else "администратора"
         _audit(conn, session, "user.delete", entity="user", entity_id=row["id"],
-               detail=f"{row['username']} · мероприятий передано: {moved}")
+               detail=f"{row['username']} · {kind} · мероприятий передано: {moved}")
         conn.execute("DELETE FROM users WHERE id = ?", (row["id"],))
         conn.commit()
     finally:
         conn.close()
-    log.info("Удалён администратор «%s»", row["username"])
+    log.info("Удалён %s «%s»", kind, row["username"])
     return json_response({"ok": True, "deletedId": row["id"]})
 
 
@@ -1734,6 +2111,520 @@ def api_admin_site_logo_delete(req):
 
 
 # --------------------------------------------------------------------------
+# Гостевые списки
+# --------------------------------------------------------------------------
+
+def _event_guest_role(conn, session, event_id: int):
+    """Мероприятие и роль: owner | promoter. Чужие события — 404."""
+    event = _event_row(conn, event_id)
+    if session["is_super"] or event["owner_id"] == session["user_id"]:
+        return event, "owner"
+    assigned = conn.execute(
+        "SELECT 1 FROM guest_list_promoters glp "
+        "JOIN guest_lists gl ON gl.id = glp.list_id "
+        "WHERE gl.event_id = ? AND glp.user_id = ? "
+        "AND gl.is_blacklist = 0 LIMIT 1",
+        (event["id"], session["user_id"]),
+    ).fetchone()
+    if assigned:
+        return event, "promoter"
+    raise APIError(404, "not_found", "Мероприятие не найдено.")
+
+
+def _guest_list_row(conn, list_id: int):
+    row = conn.execute(
+        "SELECT gl.*, e.owner_id, e.slug AS event_slug, e.title AS event_title, "
+        "e.starts_at AS event_starts, e.ends_at AS event_ends, "
+        "e.timezone AS event_timezone, e.published "
+        "FROM guest_lists gl "
+        "JOIN events e ON e.id = gl.event_id "
+        "WHERE gl.id = ?",
+        (list_id,),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "not_found", "Гостевой список не найден.")
+    return row
+
+
+def _guest_row(conn, guest_id: int):
+    row = conn.execute(
+        "SELECT g.*, gl.name AS list_name, gl.is_blacklist, e.owner_id, "
+        "e.slug AS event_slug, e.title AS event_title, "
+        "e.starts_at AS event_starts, e.ends_at AS event_ends, "
+        "e.timezone AS event_timezone, e.published "
+        "FROM guests g "
+        "JOIN guest_lists gl ON gl.id = g.list_id "
+        "JOIN events e ON e.id = g.event_id "
+        "WHERE g.id = ?",
+        (guest_id,),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "not_found", "Гость не найден.")
+    return row
+
+
+def _guest_list_for_session(conn, session, list_id: int):
+    row = _guest_list_row(conn, list_id)
+    if session["is_super"] or row["owner_id"] == session["user_id"]:
+        return row, "owner"
+    if int(row["is_blacklist"]):
+        raise APIError(404, "not_found", "Гостевой список не найден.")
+    assigned = conn.execute(
+        "SELECT 1 FROM guest_list_promoters WHERE list_id = ? AND user_id = ?",
+        (row["id"], session["user_id"]),
+    ).fetchone()
+    if assigned:
+        return row, "promoter"
+    raise APIError(404, "not_found", "Гостевой список не найден.")
+
+
+def _guest_for_session(conn, session, guest_id: int):
+    row = _guest_row(conn, guest_id)
+    list_row, role = _guest_list_for_session(conn, session, row["list_id"])
+    return row, list_row, role
+
+
+def _guest_search_clause(query: str, prefix: str = ""):
+    clause = f" AND casefold({prefix}name) LIKE ?"
+    args = [f"%{query.casefold()}%"]
+    digits = re.sub(r"\D", "", query)
+    if digits:
+        clause = (f" AND (casefold({prefix}name) LIKE ? "
+                  f"OR phone_digits({prefix}phone) LIKE ?)")
+        args.append(f"%{digits}%")
+    return clause, args
+
+
+def _normalize_guest(data: dict, current=None) -> dict:
+    current = dict(current) if current else {}
+    name = _str_field(data, "name", "имя гостя", maxlen=120,
+                      current=current.get("name", ""))
+    phone = _str_field(data, "phone", "телефон", maxlen=40, required=False,
+                       current=current.get("phone", ""))
+    table_name = _str_field(data, "tableName", "стол", maxlen=40,
+                            required=False,
+                            current=current.get("table_name", ""))
+    notes = _str_field(data, "notes", "заметку", maxlen=500, required=False,
+                       current=current.get("notes", ""))
+    status = current.get("status", "invited")
+    if "status" in data:
+        status = data.get("status")
+        if status not in GUEST_STATUSES:
+            raise APIError(400, "validation", "Некорректный статус гостя.")
+    return {
+        "name": name,
+        "phone": phone,
+        "table_name": table_name,
+        "notes": notes,
+        "status": status,
+    }
+
+
+def _new_guest_token(conn) -> str:
+    for _ in range(5):
+        token = secrets.token_urlsafe(24)
+        exists = conn.execute(
+            "SELECT 1 FROM guests WHERE share_token = ?", (token,)
+        ).fetchone()
+        if not exists:
+            return token
+    raise APIError(500, "server_error", "Не удалось создать QR-код гостя.")
+
+
+def _guest_json(row) -> dict:
+    return {
+        "id": row["id"],
+        "listId": row["list_id"],
+        "eventId": row["event_id"],
+        "listName": row["list_name"],
+        "listIsBlacklist": bool(row["is_blacklist"]),
+        "name": row["name"],
+        "phone": row["phone"],
+        "tableName": row["table_name"],
+        "notes": row["notes"],
+        "status": row["status"],
+        "shareToken": row["share_token"],
+        "checkedInAt": row["checked_in_at"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def _guest_list_json(conn, row) -> dict:
+    stats = conn.execute(
+        "SELECT COUNT(*) AS total, "
+        "COALESCE(SUM(CASE WHEN status = 'checked_in' THEN 1 ELSE 0 END), 0) "
+        "AS arrived "
+        "FROM guests WHERE list_id = ?",
+        (row["id"],),
+    ).fetchone()
+    promoters = conn.execute(
+        "SELECT u.id, u.username FROM guest_list_promoters glp "
+        "JOIN users u ON u.id = glp.user_id "
+        "WHERE glp.list_id = ? ORDER BY u.username COLLATE NOCASE",
+        (row["id"],),
+    ).fetchall()
+    return {
+        "id": row["id"],
+        "eventId": row["event_id"],
+        "name": row["name"],
+        "isBlacklist": bool(row["is_blacklist"]),
+        "promoters": [
+            {"id": item["id"], "username": item["username"]}
+            for item in promoters
+        ],
+        "guestCount": stats["total"],
+        "checkedInCount": stats["arrived"],
+    }
+
+
+def _registration_link_row(conn, link_id: int):
+    row = conn.execute(
+        "SELECT rl.*, e.title AS event_title, e.starts_at AS event_starts, "
+        "e.ends_at AS event_ends, e.timezone AS event_timezone, e.published, "
+        "gl.name AS list_name, gl.is_blacklist "
+        "FROM guest_registration_links rl "
+        "JOIN events e ON e.id = rl.event_id "
+        "JOIN guest_lists gl ON gl.id = rl.list_id "
+        "WHERE rl.id = ?",
+        (link_id,),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "not_found", "Ссылка на регистрацию не найдена.")
+    return row
+
+
+def _registration_link_by_token(conn, token: str):
+    row = conn.execute(
+        "SELECT rl.*, e.title AS event_title, e.starts_at AS event_starts, "
+        "e.ends_at AS event_ends, e.timezone AS event_timezone, e.published, "
+        "gl.name AS list_name, gl.is_blacklist "
+        "FROM guest_registration_links rl "
+        "JOIN events e ON e.id = rl.event_id "
+        "JOIN guest_lists gl ON gl.id = rl.list_id "
+        "WHERE rl.token = ?",
+        (token,),
+    ).fetchone()
+    if not row or int(row["is_blacklist"]) or not int(row["published"]):
+        raise APIError(404, "not_found", "Ссылка на регистрацию не найдена.")
+    return row
+
+
+def _registration_link_state(conn, row) -> dict:
+    count = conn.execute(
+        "SELECT COUNT(*) FROM guests WHERE registration_link_id = ?",
+        (row["id"],),
+    ).fetchone()[0]
+    now = timeutil.iso_now()
+    limit = int(row["max_registrations"]) if row["max_registrations"] else None
+    limit_reached = limit is not None and count >= limit
+    expired = bool(row["expires_at"] and row["expires_at"] < now)
+    event_ended = row["event_ends"] < now
+    published = bool(row["published"])
+    active = bool(row["is_active"])
+    reason = ""
+    if not published:
+        reason = "unpublished"
+    elif event_ended:
+        reason = "event_ended"
+    elif expired:
+        reason = "expired"
+    elif limit_reached:
+        reason = "limit"
+    elif not active:
+        reason = "closed"
+    return {
+        "registrationCount": count,
+        "maxRegistrations": limit,
+        "remaining": None if limit is None else max(0, limit - count),
+        "expired": expired,
+        "limitReached": limit_reached,
+        "eventEnded": event_ended,
+        "isActive": active,
+        "canRegister": not reason,
+        "reason": reason,
+    }
+
+
+def _registration_link_json(conn, row) -> dict:
+    state = _registration_link_state(conn, row)
+    return {
+        "id": row["id"],
+        "eventId": row["event_id"],
+        "listId": row["list_id"],
+        "listName": row["list_name"],
+        "token": row["token"],
+        "path": f"/r/{row['token']}",
+        "comment": row["comment"],
+        "expiresAt": row["expires_at"],
+        "createdAt": row["created_at"],
+        **state,
+    }
+
+
+def _registration_expiry(data: dict, event) -> str | None:
+    mode = str(data.get("expiryMode") or "never").strip()
+    if mode == "never":
+        return None
+    starts = timeutil.parse_iso(event["starts_at"])
+    if mode == "start":
+        expires = starts
+    elif mode.startswith("start+"):
+        try:
+            hours = int(mode.split("+", 1)[1])
+        except ValueError:
+            raise APIError(400, "validation",
+                           "Некорректный срок действия ссылки.") from None
+        if hours < 1 or hours > 336:
+            raise APIError(400, "validation",
+                           "Срок после начала — от 1 до 336 часов.")
+        expires = starts + timedelta(hours=hours)
+    elif mode == "custom":
+        raw = data.get("expiresAtLocal")
+        if not isinstance(raw, str) or not raw.strip():
+            raise APIError(400, "validation",
+                           "Укажите дату и время окончания.")
+        try:
+            expires = timeutil.parse_local(raw.strip(), event["timezone"])
+        except TimeError as exc:
+            raise APIError(400, "validation", str(exc)) from None
+    else:
+        raise APIError(400, "validation",
+                       "Некорректный срок действия ссылки.")
+    iso = timeutil.to_iso(expires)
+    if iso < timeutil.iso_now():
+        raise APIError(400, "validation",
+                       "Время окончания регистрации уже прошло.")
+    return iso
+
+
+def _registration_limit(raw) -> int | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise APIError(400, "validation",
+                       "Лимит регистраций должен быть числом.")
+    if raw < 1 or raw > 100000:
+        raise APIError(400, "validation",
+                       "Лимит регистраций — от 1 до 100000.")
+    return raw
+
+
+def _new_registration_token(conn) -> str:
+    for _ in range(5):
+        token = secrets.token_urlsafe(24)
+        exists = conn.execute(
+            "SELECT 1 FROM guest_registration_links WHERE token = ?", (token,)
+        ).fetchone()
+        if not exists:
+            return token
+    raise APIError(500, "server_error",
+                   "Не удалось создать ссылку на регистрацию.")
+
+
+def _registration_closed_message(reason: str) -> str:
+    return {
+        "unpublished": "Регистрация недоступна.",
+        "event_ended": "Мероприятие уже прошло.",
+        "expired": "Срок действия ссылки истёк.",
+        "limit": "Лимит регистраций по этой ссылке исчерпан.",
+        "closed": "Регистрация по этой ссылке закрыта.",
+    }.get(reason, "Регистрация закрыта.")
+
+
+def _guest_public_json(row) -> dict:
+    return {
+        "guest": {
+            "name": row["name"],
+            "tableName": row["table_name"],
+            "status": row["status"],
+        },
+        "event": {
+            "title": row["event_title"],
+            "slug": row["event_slug"],
+            "city": row["event_city"],
+            "venue": row["event_venue"],
+            "startsAt": row["event_starts"],
+            "endsAt": row["event_ends"],
+            "timezone": row["event_timezone"],
+        },
+        "serverNow": timeutil.iso_now(),
+    }
+
+
+def _public_guest_row(conn, token: str):
+    row = conn.execute(
+        "SELECT g.*, gl.name AS list_name, gl.is_blacklist, e.slug AS event_slug, "
+        "e.title AS event_title, e.city AS event_city, e.venue AS event_venue, "
+        "e.starts_at AS event_starts, "
+        "e.ends_at AS event_ends, e.timezone AS event_timezone, e.published "
+        "FROM guests g "
+        "JOIN guest_lists gl ON gl.id = g.list_id "
+        "JOIN events e ON e.id = g.event_id "
+        "WHERE g.share_token = ?",
+        (token,),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "not_found", "Приглашение не найдено.")
+    if int(row["is_blacklist"]):
+        raise APIError(404, "not_found", "Приглашение не найдено.")
+    if not int(row["published"]):
+        raise APIError(404, "not_found", "Приглашение не найдено.")
+    if row["event_ends"] < timeutil.iso_now():
+        raise APIError(404, "not_found", "Мероприятие уже прошло.")
+    return row
+
+
+def _door_link_row(conn, token: str):
+    row = conn.execute(
+        "SELECT d.event_id AS link_event_id, d.token AS link_token, "
+        "d.created_at AS link_created_at, e.* "
+        "FROM event_door_links d JOIN events e ON e.id = d.event_id "
+        "WHERE d.token = ?",
+        (token,),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "not_found",
+                       "Ссылка для охраны или персонала недействительна.")
+    if not int(row["published"]):
+        raise APIError(404, "not_found", "Мероприятие не опубликовано.")
+    if row["ends_at"] < timeutil.iso_now():
+        raise APIError(404, "not_found", "Мероприятие уже прошло.")
+    return row
+
+
+def _door_event_stats(conn, event_id: int) -> dict:
+    row = conn.execute(
+        "SELECT COUNT(*) AS total, "
+        "COALESCE(SUM(CASE WHEN g.status = 'checked_in' THEN 1 ELSE 0 END), 0) "
+        "AS arrived "
+        "FROM guests g JOIN guest_lists gl ON gl.id = g.list_id "
+        "WHERE g.event_id = ? AND gl.is_blacklist = 0", (event_id,)
+    ).fetchone()
+    return {
+        "guestCount": row["total"],
+        "checkedInCount": row["arrived"],
+    }
+
+
+def _door_event_json(conn, row) -> dict:
+    return {
+        "event": {
+            "id": row["link_event_id"],
+            "title": row["title"],
+            "slug": row["slug"],
+            "startsAt": row["starts_at"],
+            "endsAt": row["ends_at"],
+            "timezone": row["timezone"],
+        },
+        "stats": _door_event_stats(conn, row["link_event_id"]),
+        "serverNow": timeutil.iso_now(),
+    }
+
+
+def _mask_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return ""
+    if len(digits) <= 4:
+        return digits
+    return f"•••• {digits[-4:]}"
+
+
+def _door_guest_json(row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "phoneMasked": _mask_phone(row["phone"]),
+        "listName": row["list_name"],
+        "blacklisted": bool(row["is_blacklist"]),
+        "tableName": row["table_name"],
+        "notes": row["notes"],
+        "status": row["status"],
+        "checkedInAt": row["checked_in_at"],
+    }
+
+
+def _door_guest_row(conn, event_id: int, guest_id: int):
+    row = conn.execute(
+        "SELECT g.*, gl.name AS list_name, gl.is_blacklist FROM guests g "
+        "JOIN guest_lists gl ON gl.id = g.list_id "
+        "WHERE g.id = ? AND g.event_id = ?",
+        (guest_id, event_id),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "not_found", "Гость не найден.")
+    return row
+
+
+def _blacklist_match(conn, event_id: int, guest):
+    """Возвращает запись из чёрного списка, совпавшую с гостем."""
+    if int(guest["is_blacklist"]):
+        return guest
+    phone = re.sub(r"\D", "", guest["phone"] or "")
+    name = (guest["name"] or "").strip().casefold()
+    rows = conn.execute(
+        "SELECT g.*, gl.name AS list_name, gl.is_blacklist FROM guests g "
+        "JOIN guest_lists gl ON gl.id = g.list_id "
+        "WHERE g.event_id = ? AND gl.is_blacklist = 1 AND g.id != ?",
+        (event_id, guest["id"]),
+    ).fetchall()
+    for row in rows:
+        row_phone = re.sub(r"\D", "", row["phone"] or "")
+        row_name = (row["name"] or "").strip().casefold()
+        if len(phone) >= 4 and phone == row_phone:
+            return row
+        if len(name) >= 3 and name == row_name:
+            return row
+    return None
+
+
+def _door_checkin(conn, door_row, guest) -> bool:
+    if guest["status"] == "checked_in":
+        return False
+    now = timeutil.iso_now()
+    conn.execute(
+        "UPDATE guests SET status = 'checked_in', checked_in_at = ?, "
+        "checked_in_by = NULL, updated_at = ? "
+        "WHERE id = ? AND event_id = ? AND status != 'checked_in'",
+        (now, now, guest["id"], door_row["link_event_id"]),
+    )
+    _audit(conn, {"user_id": None, "username": "door"},
+           "guest.checkin", entity="guest", entity_id=guest["id"],
+           event_id=door_row["link_event_id"],
+           detail=(f"{door_row['title']} · {guest['list_name']} · "
+                   f"{guest['name']} · вход"))
+    conn.commit()
+    return True
+
+
+def _door_undo(conn, door_row, guest) -> None:
+    now = timeutil.iso_now()
+    conn.execute(
+        "UPDATE guests SET status = 'invited', checked_in_at = NULL, "
+        "checked_in_by = NULL, updated_at = ? WHERE id = ? AND event_id = ?",
+        (now, guest["id"], door_row["link_event_id"]),
+    )
+    _audit(conn, {"user_id": None, "username": "door"},
+           "guest.return", entity="guest", entity_id=guest["id"],
+           event_id=door_row["link_event_id"],
+           detail=f"{door_row['title']} · {guest['name']} · вход отменён")
+    conn.commit()
+
+
+def _new_door_token(conn) -> str:
+    for _ in range(5):
+        token = secrets.token_urlsafe(24)
+        exists = conn.execute(
+            "SELECT 1 FROM event_door_links WHERE token = ?", (token,)
+        ).fetchone()
+        if not exists:
+            return token
+    raise APIError(500, "server_error",
+                   "Не удалось создать ссылку для персонала.")
+
+
+# --------------------------------------------------------------------------
 # Админка: мероприятия
 # --------------------------------------------------------------------------
 
@@ -1879,8 +2770,13 @@ def api_admin_events(req):
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM events WHERE owner_id = ? ORDER BY starts_at DESC",
-                (session["user_id"],),
+                "SELECT DISTINCT e.* FROM events e "
+                "LEFT JOIN guest_list_promoters glp ON glp.user_id = ? "
+                "LEFT JOIN guest_lists gl ON gl.id = glp.list_id "
+                "AND gl.event_id = e.id AND gl.is_blacklist = 0 "
+                "WHERE e.owner_id = ? OR gl.id IS NOT NULL "
+                "ORDER BY e.starts_at DESC",
+                (session["user_id"], session["user_id"]),
             ).fetchall()
         events = []
         for row in rows:
@@ -1900,6 +2796,12 @@ def api_admin_events(req):
                 "ownerId": row["owner_id"],
                 "ownerUsername": _event_owner_name(conn, row),
                 "publiclyVisible": _is_publicly_visible(row),
+                "guestRole": (
+                    "owner"
+                    if session["is_super"]
+                    or row["owner_id"] == session["user_id"]
+                    else "promoter"
+                ),
             })
             events.append(item)
         return json_response({"events": events, "timezones": TIMEZONES,
@@ -1911,6 +2813,9 @@ def api_admin_events(req):
 @route(r"/api/admin/events", methods=("POST",))
 def api_admin_event_create(req):
     session = _require_admin(req)
+    if session["is_promoter"]:
+        raise APIError(403, "forbidden",
+                       "Промоутер не может создавать мероприятия.")
     data = req.json()
     fields = _normalize_event(data)
     conn = db.connect()
@@ -1929,6 +2834,7 @@ def api_admin_event_create(req):
              timeutil.iso_now()),
         )
         event_id = int(cur.lastrowid)
+        db.ensure_blacklist(conn, event_id, session["user_id"])
         links = _normalize_links(data)
         if links:
             _replace_links(conn, event_id, links)
@@ -2118,6 +3024,772 @@ def api_admin_event_delete(req, event_id):
         conn.commit()
         log.info("Удалено мероприятие #%s «%s»", row["id"], row["title"])
         return json_response({"ok": True, "deletedId": row["id"]})
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Админка: гостевые списки
+# --------------------------------------------------------------------------
+
+@route(r"/api/admin/events/(\d{1,12})/registration-links")
+def api_admin_registration_links(req, event_id):
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Ссылки на регистрацию доступны организатору.")
+        rows = conn.execute(
+            "SELECT rl.*, e.title AS event_title, e.starts_at AS event_starts, "
+            "e.ends_at AS event_ends, e.timezone AS event_timezone, e.published, "
+            "gl.name AS list_name, gl.is_blacklist "
+            "FROM guest_registration_links rl "
+            "JOIN events e ON e.id = rl.event_id "
+            "JOIN guest_lists gl ON gl.id = rl.list_id "
+            "WHERE rl.event_id = ? ORDER BY rl.id DESC",
+            (event["id"],),
+        ).fetchall()
+        return json_response({
+            "links": [_registration_link_json(conn, row) for row in rows],
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/registration-links",
+       methods=("POST",))
+def api_admin_registration_link_create(req, event_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Создавать ссылки может только организатор.")
+        list_id = data.get("listId")
+        if isinstance(list_id, bool) or not isinstance(list_id, int):
+            raise APIError(400, "validation", "Выберите гостевой список.")
+        target = _guest_list_row(conn, list_id)
+        if target["event_id"] != event["id"]:
+            raise APIError(400, "validation",
+                           "Список относится к другому мероприятию.")
+        if int(target["is_blacklist"]):
+            raise APIError(400, "validation",
+                           "В чёрный список саморегистрация недоступна.")
+        count = conn.execute(
+            "SELECT COUNT(*) FROM guest_registration_links WHERE event_id = ?",
+            (event["id"],),
+        ).fetchone()[0]
+        if count >= 100:
+            raise APIError(400, "validation",
+                           "Слишком много ссылок на регистрацию.")
+        comment = data.get("comment", "")
+        if comment is None:
+            comment = ""
+        if not isinstance(comment, str):
+            raise APIError(400, "validation",
+                           "Комментарий должен быть строкой.")
+        comment = comment.strip()
+        if len(comment) > 500:
+            raise APIError(400, "validation",
+                           "Комментарий — до 500 символов.")
+        limit = _registration_limit(data.get("maxRegistrations"))
+        expires_at = _registration_expiry(data, event)
+        token = _new_registration_token(conn)
+        now = timeutil.iso_now()
+        cur = conn.execute(
+            "INSERT INTO guest_registration_links (event_id, list_id, token, "
+            "comment, max_registrations, expires_at, is_active, created_by, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (event["id"], target["id"], token, comment, limit, expires_at,
+             session["user_id"], now),
+        )
+        _audit(conn, session, "registration.link.create",
+               entity="registration_link", entity_id=int(cur.lastrowid),
+               event_id=event["id"],
+               detail=f"{event['title']} · {target['name']} · {comment or 'без комментария'}")
+        conn.commit()
+        row = _registration_link_row(conn, int(cur.lastrowid))
+        return json_response({"link": _registration_link_json(conn, row)}, 201)
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/registration-links/(\d{1,12})",
+       methods=("PATCH", "PUT"))
+def api_admin_registration_link_update(req, link_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        row = _registration_link_row(conn, int(link_id))
+        event, role = _event_guest_role(conn, session, row["event_id"])
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Менять ссылку может только организатор.")
+        if "isActive" in data:
+            if not isinstance(data["isActive"], bool):
+                raise APIError(400, "validation",
+                               "Некорректный статус ссылки.")
+            conn.execute(
+                "UPDATE guest_registration_links SET is_active = ? WHERE id = ?",
+                (1 if data["isActive"] else 0, row["id"]),
+            )
+        if "comment" in data:
+            comment = data.get("comment")
+            if not isinstance(comment, str):
+                raise APIError(400, "validation",
+                               "Комментарий должен быть строкой.")
+            comment = comment.strip()
+            if len(comment) > 500:
+                raise APIError(400, "validation",
+                               "Комментарий — до 500 символов.")
+            conn.execute(
+                "UPDATE guest_registration_links SET comment = ? WHERE id = ?",
+                (comment, row["id"]),
+            )
+        _audit(conn, session, "registration.link.update",
+               entity="registration_link", entity_id=row["id"],
+               event_id=row["event_id"],
+               detail=f"{event['title']} · {row['comment']}")
+        conn.commit()
+        updated = _registration_link_row(conn, row["id"])
+        return json_response({"link": _registration_link_json(conn, updated)})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/registration-links/(\d{1,12})", methods=("DELETE",))
+def api_admin_registration_link_delete(req, link_id):
+    session = _require_admin(req)
+    conn = db.connect()
+    try:
+        row = _registration_link_row(conn, int(link_id))
+        event, role = _event_guest_role(conn, session, row["event_id"])
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Удалять ссылку может только организатор.")
+        count = conn.execute(
+            "SELECT COUNT(*) FROM guests WHERE registration_link_id = ?",
+            (row["id"],),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE guests SET registration_link_id = NULL "
+            "WHERE registration_link_id = ?", (row["id"],))
+        conn.execute(
+            "DELETE FROM guest_registration_links WHERE id = ?", (row["id"],))
+        _audit(conn, session, "registration.link.delete",
+               entity="registration_link", entity_id=row["id"],
+               event_id=row["event_id"],
+               detail=(f"{event['title']} · {row['comment'] or 'без комментария'}"
+                       f" · регистраций: {count}"))
+        conn.commit()
+        return json_response({
+            "ok": True,
+            "deletedId": row["id"],
+            "registrations": count,
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/guest-lists")
+def api_admin_event_guest_lists(req, event_id):
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role == "owner":
+            db.ensure_blacklist(conn, event["id"], event["owner_id"])
+            conn.commit()
+            rows = conn.execute(
+                "SELECT gl.*, e.owner_id, e.slug AS event_slug, "
+                "e.title AS event_title, e.starts_at AS event_starts, "
+                "e.ends_at AS event_ends, e.timezone AS event_timezone, "
+                "e.published "
+                "FROM guest_lists gl JOIN events e ON e.id = gl.event_id "
+                "WHERE gl.event_id = ? "
+                "ORDER BY gl.is_blacklist, gl.position, gl.id",
+                (event["id"],),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT gl.*, e.owner_id, e.slug AS event_slug, "
+                "e.title AS event_title, e.starts_at AS event_starts, "
+                "e.ends_at AS event_ends, e.timezone AS event_timezone, "
+                "e.published "
+                "FROM guest_lists gl JOIN events e ON e.id = gl.event_id "
+                "JOIN guest_list_promoters glp ON glp.list_id = gl.id "
+                "WHERE gl.event_id = ? AND glp.user_id = ? "
+                "AND gl.is_blacklist = 0 "
+                "ORDER BY gl.position, gl.id",
+                (event["id"], session["user_id"]),
+            ).fetchall()
+        return json_response({
+            "event": {
+                "id": event["id"],
+                "title": event["title"],
+                "slug": event["slug"],
+                "startsAt": event["starts_at"],
+                "endsAt": event["ends_at"],
+                "timezone": event["timezone"],
+                "published": bool(event["published"]),
+            },
+            "role": role,
+            "lists": [_guest_list_json(conn, row) for row in rows],
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/guest-lists", methods=("POST",))
+def api_admin_guest_list_create(req, event_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Создавать списки может только организатор мероприятия.")
+        purged = db.purge_expired_promoters(conn, timeutil.iso_now()[:10])
+        if purged:
+            conn.commit()
+        name = _str_field(data, "name", "название списка", maxlen=60)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM guest_lists WHERE event_id = ?", (event["id"],)
+        ).fetchone()[0]
+        if count >= MAX_GUEST_LISTS:
+            raise APIError(400, "validation",
+                           f"Можно создать не больше {MAX_GUEST_LISTS} списков.")
+        promoter_username = data.get("promoterUsername", "")
+        if promoter_username is None:
+            promoter_username = ""
+        if not isinstance(promoter_username, str):
+            raise APIError(400, "validation", "Логин промоутера должен быть строкой.")
+        promoter_username = promoter_username.strip()
+        promoter_user_id = None
+        if promoter_username:
+            user = conn.execute(
+                "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                (promoter_username,),
+            ).fetchone()
+            if not user:
+                raise APIError(400, "validation",
+                               "Пользователь с таким логином не найден.")
+            promoter_user_id = user["id"]
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM guest_lists "
+            "WHERE event_id = ?", (event["id"],)
+        ).fetchone()[0]
+        now = timeutil.iso_now()
+        cur = conn.execute(
+            "INSERT INTO guest_lists (event_id, name, created_by, "
+            "created_at, position) VALUES (?, ?, ?, ?, ?)",
+            (event["id"], name, session["user_id"], now, position),
+        )
+        list_id = int(cur.lastrowid)
+        if promoter_user_id:
+            conn.execute(
+                "INSERT OR IGNORE INTO guest_list_promoters "
+                "(list_id, user_id, created_at) VALUES (?, ?, ?)",
+                (list_id, promoter_user_id, now),
+            )
+        _audit(conn, session, "guest_list.create", entity="guest_list",
+               entity_id=list_id, event_id=event["id"],
+               detail=(f"{event['title']} · {name}"
+                       + (f" · промоутер: {promoter_username}"
+                          if promoter_username else "")))
+        conn.commit()
+        row = _guest_list_row(conn, list_id)
+        return json_response({"list": _guest_list_json(conn, row)}, 201)
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/guest-lists/(\d{1,12})", methods=("PATCH", "PUT"))
+def api_admin_guest_list_update(req, list_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        row, role = _guest_list_for_session(conn, session, int(list_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Менять список может только организатор мероприятия.")
+        if int(row["is_blacklist"]):
+            raise APIError(400, "validation",
+                           "Чёрный список нельзя переименовать или назначить промоутерам.")
+        purged = db.purge_expired_promoters(conn, timeutil.iso_now()[:10])
+        if purged:
+            conn.commit()
+        name = row["name"]
+        if "name" in data:
+            name = _str_field(data, "name", "название списка", maxlen=60,
+                              current=row["name"])
+        promoter_usernames = None
+        if "promoterUsernames" in data:
+            raw = data.get("promoterUsernames")
+            if not isinstance(raw, list):
+                raise APIError(400, "validation",
+                               "Список промоутеров должен быть массивом логинов.")
+            promoter_usernames = raw
+        elif "promoterUsername" in data:
+            raw = data.get("promoterUsername")
+            if raw is None:
+                raw = ""
+            if not isinstance(raw, str):
+                raise APIError(400, "validation",
+                               "Логин промоутера должен быть строкой.")
+            promoter_usernames = [raw] if raw.strip() else []
+        if promoter_usernames is not None:
+            if len(promoter_usernames) > 50:
+                raise APIError(400, "validation", "Слишком много промоутеров.")
+            resolved = []
+            seen = set()
+            for raw in promoter_usernames:
+                if not isinstance(raw, str):
+                    raise APIError(400, "validation",
+                                   "Логин промоутера должен быть строкой.")
+                username = raw.strip()
+                if not username or username.casefold() in seen:
+                    continue
+                seen.add(username.casefold())
+                user = conn.execute(
+                    "SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
+                    (username,),
+                ).fetchone()
+                if not user:
+                    raise APIError(400, "validation",
+                                   f"Пользователь «{username}» не найден.")
+                resolved.append(user)
+            conn.execute(
+                "DELETE FROM guest_list_promoters WHERE list_id = ?", (row["id"],))
+            now = timeutil.iso_now()
+            for user in resolved:
+                conn.execute(
+                    "INSERT INTO guest_list_promoters "
+                    "(list_id, user_id, created_at) VALUES (?, ?, ?)",
+                    (row["id"], user["id"], now),
+                )
+        conn.execute(
+            "UPDATE guest_lists SET name = ? WHERE id = ?",
+            (name, row["id"]),
+        )
+        _audit(conn, session, "guest_list.update", entity="guest_list",
+               entity_id=row["id"], event_id=row["event_id"],
+               detail=f"{row['event_title']} · {name}")
+        conn.commit()
+        return json_response({"list": _guest_list_json(
+            conn, _guest_list_row(conn, row["id"]))})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/promoters", methods=("GET",))
+def api_admin_event_promoters_list(req, event_id):
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Список промоутеров доступен организатору.")
+        purged = db.purge_expired_promoters(conn, timeutil.iso_now()[:10])
+        if purged:
+            conn.commit()
+        base = (
+            "SELECT u.*, c.username AS created_by_username FROM users u "
+            "LEFT JOIN users c ON c.id = u.created_by "
+            "WHERE u.is_promoter = 1 "
+        )
+        if session["is_super"]:
+            rows = conn.execute(base + "ORDER BY u.username COLLATE NOCASE"
+                                ).fetchall()
+        else:
+            rows = conn.execute(
+                base + "AND u.created_by = ? ORDER BY u.username COLLATE NOCASE",
+                (session["user_id"],),
+            ).fetchall()
+        return json_response({"promoters": [_user_json(row) for row in rows]})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/promoters", methods=("POST",))
+def api_admin_event_promoter_add(req, event_id):
+    session = _require_admin(req)
+    data = req.json()
+    username = str(data.get("username") or "").strip()
+    if not username:
+        raise APIError(400, "validation", "Укажите логин промоутера.")
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Назначать промоутеров может только организатор.")
+        purged = db.purge_expired_promoters(conn, timeutil.iso_now()[:10])
+        if purged:
+            conn.commit()
+        user = conn.execute(
+            "SELECT id, username FROM users WHERE username = ? COLLATE NOCASE",
+            (username,),
+        ).fetchone()
+        if not user:
+            raise APIError(400, "validation",
+                           f"Пользователь «{username}» не найден.")
+        list_id = data.get("listId")
+        if list_id is not None:
+            if isinstance(list_id, bool) or not isinstance(list_id, int):
+                raise APIError(400, "validation", "Некорректный список.")
+            target = _guest_list_row(conn, list_id)
+            if target["event_id"] != event["id"]:
+                raise APIError(400, "validation",
+                               "Список относится к другому мероприятию.")
+            if int(target["is_blacklist"]):
+                raise APIError(400, "validation",
+                               "В чёрный список промоутеров не назначают.")
+            targets = [target]
+        else:
+            targets = conn.execute(
+                "SELECT * FROM guest_lists WHERE event_id = ? "
+                "AND is_blacklist = 0 ORDER BY position, id",
+                (event["id"],),
+            ).fetchall()
+        now = timeutil.iso_now()
+        for target in targets:
+            conn.execute(
+                "INSERT OR IGNORE INTO guest_list_promoters "
+                "(list_id, user_id, created_at) VALUES (?, ?, ?)",
+                (target["id"], user["id"], now),
+            )
+        scope = "во все списки" if list_id is None else "в список"
+        _audit(conn, session, "guest_list.promoter.add", entity="guest_list",
+               event_id=event["id"],
+               detail=f"{event['title']} · {user['username']} · {scope}")
+        conn.commit()
+        return json_response({
+            "ok": True,
+            "username": user["username"],
+            "lists": len(targets),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/guest-lists/(\d{1,12})/promoters/(\d{1,12})",
+       methods=("DELETE",))
+def api_admin_guest_list_promoter_remove(req, list_id, user_id):
+    session = _require_admin(req)
+    conn = db.connect()
+    try:
+        row, role = _guest_list_for_session(conn, session, int(list_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Убирать промоутеров может только организатор.")
+        if int(row["is_blacklist"]):
+            raise APIError(400, "validation",
+                           "В чёрном списке нет промоутеров.")
+        user = conn.execute(
+            "SELECT id, username FROM users WHERE id = ?", (int(user_id),)
+        ).fetchone()
+        if not user:
+            raise APIError(404, "not_found", "Пользователь не найден.")
+        deleted = conn.execute(
+            "DELETE FROM guest_list_promoters WHERE list_id = ? AND user_id = ?",
+            (row["id"], user["id"]),
+        ).rowcount
+        _audit(conn, session, "guest_list.promoter.remove", entity="guest_list",
+               entity_id=row["id"], event_id=row["event_id"],
+               detail=f"{row['event_title']} · {row['name']} · {user['username']}")
+        conn.commit()
+        return json_response({"ok": True, "deleted": bool(deleted)})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/promoters/(\d{1,12})",
+       methods=("DELETE",))
+def api_admin_event_promoter_remove(req, event_id, user_id):
+    session = _require_admin(req)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Убирать промоутеров может только организатор.")
+        user = conn.execute(
+            "SELECT id, username FROM users WHERE id = ?", (int(user_id),)
+        ).fetchone()
+        if not user:
+            raise APIError(404, "not_found", "Пользователь не найден.")
+        deleted = conn.execute(
+            "DELETE FROM guest_list_promoters WHERE user_id = ? AND list_id IN "
+            "(SELECT id FROM guest_lists WHERE event_id = ? AND is_blacklist = 0)",
+            (user["id"], event["id"]),
+        ).rowcount
+        _audit(conn, session, "guest_list.promoter.remove", entity="guest_list",
+               event_id=event["id"],
+               detail=f"{event['title']} · {user['username']} · со всех списков")
+        conn.commit()
+        return json_response({"ok": True, "deleted": deleted})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/guest-lists/(\d{1,12})", methods=("DELETE",))
+def api_admin_guest_list_delete(req, list_id):
+    session = _require_admin(req)
+    conn = db.connect()
+    try:
+        row, role = _guest_list_for_session(conn, session, int(list_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Удалять список может только организатор мероприятия.")
+        if int(row["is_blacklist"]):
+            raise APIError(400, "validation",
+                           "Чёрный список удалить нельзя.")
+        count = conn.execute(
+            "SELECT COUNT(*) FROM guests WHERE list_id = ?", (row["id"],)
+        ).fetchone()[0]
+        _audit(conn, session, "guest_list.delete", entity="guest_list",
+               entity_id=row["id"], event_id=row["event_id"],
+               detail=f"{row['event_title']} · {row['name']} · гостей: {count}")
+        conn.execute("DELETE FROM guest_lists WHERE id = ?", (row["id"],))
+        conn.commit()
+        return json_response({"ok": True, "deletedId": row["id"]})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/guest-lists/(\d{1,12})/guests")
+def api_admin_guest_list_guests(req, list_id):
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        row, role = _guest_list_for_session(conn, session, int(list_id))
+        query = (parse_qs(req.query).get("q") or [""])[0].strip()[:80]
+        sql = (
+            "SELECT g.*, gl.name AS list_name, gl.is_blacklist "
+            "FROM guests g JOIN guest_lists gl ON gl.id = g.list_id "
+            "WHERE g.list_id = ?"
+        )
+        args = [row["id"]]
+        if query:
+            clause, extra = _guest_search_clause(query, "g.")
+            sql += clause
+            args.extend(extra)
+        sql += (" ORDER BY CASE g.status WHEN 'checked_in' THEN 1 ELSE 0 END, "
+                "g.name COLLATE NOCASE, g.id DESC")
+        guests = conn.execute(sql, args).fetchall()
+        return json_response({
+            "list": _guest_list_json(conn, row),
+            "role": role,
+            "guests": [_guest_json(guest) for guest in guests],
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/guest-lists/(\d{1,12})/guests", methods=("POST",))
+def api_admin_guest_create(req, list_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        row, role = _guest_list_for_session(conn, session, int(list_id))
+        count = conn.execute(
+            "SELECT COUNT(*) FROM guests WHERE list_id = ?", (row["id"],)
+        ).fetchone()[0]
+        if count >= MAX_GUESTS_PER_LIST:
+            raise APIError(400, "validation",
+                           f"В списке уже {MAX_GUESTS_PER_LIST} гостей.")
+        fields = _normalize_guest(data)
+        token = _new_guest_token(conn)
+        now = timeutil.iso_now()
+        cur = conn.execute(
+            "INSERT INTO guests (list_id, event_id, name, phone, "
+            "table_name, notes, status, share_token, created_by, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, 'invited', ?, ?, ?, ?)",
+            (row["id"], row["event_id"], fields["name"], fields["phone"],
+             fields["table_name"], fields["notes"],
+             token, session["user_id"], now, now),
+        )
+        _audit(conn, session, "guest.create", entity="guest",
+               entity_id=int(cur.lastrowid), event_id=row["event_id"],
+               detail=(f"{row['event_title']} · {row['name']} · "
+                       f"{fields['name']}"))
+        conn.commit()
+        guest = _guest_row(conn, int(cur.lastrowid))
+        return json_response({
+            "guest": _guest_json(guest),
+            "list": _guest_list_json(conn, _guest_list_row(conn, row["id"])),
+        }, 201)
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/guests/(\d{1,12})", methods=("PATCH", "PUT"))
+def api_admin_guest_update(req, guest_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        guest, row, role = _guest_for_session(conn, session, int(guest_id))
+        fields = _normalize_guest(data, current=guest)
+        target_id = guest["list_id"]
+        target_list = row
+        if "listId" in data:
+            raw_list = data.get("listId")
+            if isinstance(raw_list, bool) or not isinstance(raw_list, int):
+                raise APIError(400, "validation", "Некорректный список.")
+            target_list, _target_role = _guest_list_for_session(
+                conn, session, raw_list)
+            if target_list["event_id"] != guest["event_id"]:
+                raise APIError(400, "validation",
+                               "Список относится к другому мероприятию.")
+            target_id = target_list["id"]
+        now = timeutil.iso_now()
+        old_status = guest["status"]
+        new_status = fields["status"]
+        checked_in_at = guest["checked_in_at"]
+        checked_in_by = guest["checked_in_by"]
+        target_blacklist = bool(int(target_list["is_blacklist"]))
+        if new_status == "checked_in" and target_blacklist:
+            raise APIError(400, "validation",
+                           "Гостя из чёрного списка нельзя отметить как пришедшего.")
+        if new_status == "checked_in" and old_status != "checked_in":
+            checked_in_at = now
+            checked_in_by = session["user_id"]
+        elif new_status != "checked_in" or target_blacklist:
+            new_status = "invited" if target_blacklist else new_status
+            checked_in_at = None
+            checked_in_by = None
+        conn.execute(
+            "UPDATE guests SET list_id = ?, name = ?, phone = ?, "
+            "table_name = ?, notes = ?, status = ?, checked_in_at = ?, "
+            "checked_in_by = ?, updated_at = ? WHERE id = ?",
+            (target_id, fields["name"], fields["phone"],
+             fields["table_name"], fields["notes"], new_status,
+             checked_in_at, checked_in_by, now, guest["id"]),
+        )
+        moved = ""
+        if target_id != guest["list_id"]:
+            moved = f" · перенос: {guest['list_name']} → {target_list['name']}"
+        if new_status == "checked_in" and old_status != "checked_in":
+            action = "guest.checkin"
+            detail = (f"{row['event_title']} · {row['name']} · "
+                      f"{fields['name']}{moved}")
+        elif new_status != "checked_in" and old_status == "checked_in":
+            action = "guest.return"
+            detail = (f"{row['event_title']} · {row['name']} · "
+                      f"{fields['name']}{moved}")
+        else:
+            action = "guest.update"
+            detail = (f"{row['event_title']} · {row['name']} · "
+                      f"{fields['name']}{moved}")
+        _audit(conn, session, action, entity="guest", entity_id=guest["id"],
+               event_id=row["event_id"], detail=detail)
+        conn.commit()
+        updated = _guest_row(conn, guest["id"])
+        return json_response({
+            "guest": _guest_json(updated),
+            "list": _guest_list_json(conn, _guest_list_row(conn, row["id"])),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/guests/(\d{1,12})", methods=("DELETE",))
+def api_admin_guest_delete(req, guest_id):
+    session = _require_admin(req)
+    conn = db.connect()
+    try:
+        guest, row, role = _guest_for_session(conn, session, int(guest_id))
+        _audit(conn, session, "guest.delete", entity="guest",
+               entity_id=guest["id"], event_id=row["event_id"],
+               detail=f"{row['event_title']} · {row['name']} · {guest['name']}")
+        conn.execute("DELETE FROM guests WHERE id = ?", (guest["id"],))
+        conn.commit()
+        return json_response({"ok": True, "deletedId": guest["id"]})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/door-link")
+def api_admin_door_link_get(req, event_id):
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Ссылку для персонала создаёт организатор мероприятия.")
+        row = conn.execute(
+            "SELECT token, created_at FROM event_door_links WHERE event_id = ?",
+            (event["id"],),
+        ).fetchone()
+        return json_response({
+            "link": ({
+                "path": f"/door/{row['token']}",
+                "createdAt": row["created_at"],
+            } if row else None),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/door-link", methods=("POST",))
+def api_admin_door_link_create(req, event_id):
+    session = _require_admin(req)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Ссылку для персонала создаёт организатор мероприятия.")
+        token = _new_door_token(conn)
+        now = timeutil.iso_now()
+        conn.execute(
+            "INSERT INTO event_door_links (event_id, token, created_by, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET "
+            "token = excluded.token, created_by = excluded.created_by, "
+            "created_at = excluded.created_at",
+            (event["id"], token, session["user_id"], now),
+        )
+        _audit(conn, session, "door.link", entity="event",
+               entity_id=event["id"], event_id=event["id"],
+               detail=f"{event['title']} · ссылка для персонала обновлена")
+        conn.commit()
+        return json_response({
+            "link": {"path": f"/door/{token}", "createdAt": now},
+        }, 201)
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/door-link", methods=("DELETE",))
+def api_admin_door_link_delete(req, event_id):
+    session = _require_admin(req)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Ссылку для персонала отзывает организатор мероприятия.")
+        deleted = conn.execute(
+            "DELETE FROM event_door_links WHERE event_id = ?", (event["id"],)
+        ).rowcount
+        if deleted:
+            _audit(conn, session, "door.link", entity="event",
+                   entity_id=event["id"], event_id=event["id"],
+                   detail=f"{event['title']} · ссылка для персонала отозвана")
+        conn.commit()
+        return json_response({"ok": True, "deleted": bool(deleted)})
     finally:
         conn.close()
 

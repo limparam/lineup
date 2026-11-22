@@ -12,6 +12,7 @@ const $ = (id) => document.getElementById(id);
 const loginView = $("view-login");
 const eventsView = $("view-events");
 const eventView = $("view-event");
+const guestsView = $("view-guests");
 const usersView = $("view-users");
 const auditView = $("view-audit");
 const performersView = $("view-performers");
@@ -42,11 +43,23 @@ const shiftForm = $("shift-form");
 let csrf = null;
 let username = "";
 let isSuper = false;
+let isPromoter = false;
 let editingUserId = null;
 let timezones = [];
 let current = null;
 let allPerformers = [];
 const selectedPerfIds = new Set();
+let guestEvent = null;
+let guestRole = "";
+let guestLists = [];
+let activeGuestListId = null;
+let guestItems = [];
+let guestSearchTimer = null;
+let editingGuestId = null;
+let availablePromoters = [];
+let registrationLinks = [];
+let registrationTimer = null;
+let doorLink = null;
 
 /* --------------------------------------------------------------- utils */
 
@@ -65,9 +78,11 @@ function setBusy(button, busy) {
 }
 
 function showView(name) {
+  if (name !== "guests") stopRegistrationRefresh();
   loginView.hidden = name !== "login";
   eventsView.hidden = name !== "events";
   eventView.hidden = name !== "event";
+  guestsView.hidden = name !== "guests";
   usersView.hidden = name !== "users";
   auditView.hidden = name !== "audit";
   performersView.hidden = name !== "performers";
@@ -75,7 +90,8 @@ function showView(name) {
   const authed = name !== "login";
   $("logout-btn").hidden = !authed;
   $("account-btn").hidden = !authed;
-  $("users-btn").hidden = !(authed && isSuper);
+  $("users-btn").hidden = !(authed && !isPromoter);
+  $("users-btn").textContent = isSuper ? "Админы" : "Промоутеры";
   $("audit-btn").hidden = !(authed && isSuper);
   $("performers-btn").hidden = !(authed && isSuper);
   $("site-btn").hidden = !(authed && isSuper);
@@ -99,6 +115,15 @@ function showLogin({ setup = false, message = null } = {}) {
   current = null;
   username = "";
   isSuper = false;
+  isPromoter = false;
+  guestEvent = null;
+  guestRole = "";
+  guestLists = [];
+  activeGuestListId = null;
+  guestItems = [];
+  editingGuestId = null;
+  availablePromoters = [];
+  registrationLinks = [];
   $("who").textContent = "";
   setupHint.hidden = !setup;
   loginError.hidden = !message;
@@ -258,6 +283,13 @@ function expiredTag(event) {
 function renderEventList(events) {
   const host = $("admin-events");
   clear(host);
+  const promoterMode = isPromoter
+    || (events.length > 0
+      && events.every((event) => event.guestRole === "promoter"));
+  $("new-event").hidden = promoterMode;
+  $("events-sub").textContent = promoterMode
+    ? "Мероприятия, где вы ведёте гостевые списки."
+    : "Создавайте события, добавляйте залы и расписание сетов.";
 
   if (!events.length) {
     host.append(
@@ -270,6 +302,7 @@ function renderEventList(events) {
   }
 
   for (const event of events) {
+    const isPromoter = event.guestRole === "promoter";
     const metaParts = [
       formatRangeShort(event.startsAt, event.endsAt, event.timezone),
       [event.city, event.venue].filter(Boolean).join(" · "),
@@ -281,36 +314,44 @@ function renderEventList(events) {
 
     const actions = [
       el("button", {
+        class: "btn btn--sm" + (isPromoter ? " btn--primary" : ""),
+        type: "button",
+        text: "Гости",
+        onClick: () => openGuests(event.id).catch((error) => toast(error.message, "error")),
+      }),
+    ];
+    if (!isPromoter) {
+      actions.push(el("button", {
         class: "btn btn--sm",
         type: "button",
         text: "Открыть",
         onClick: () => openEvent(event.id).catch((error) => toast(error.message, "error")),
-      }),
-    ];
-    if (canShareEvent(event)) {
+      }));
+      if (canShareEvent(event)) {
+        actions.push(el("button", {
+          class: "btn btn--sm",
+          type: "button",
+          text: "Ссылка",
+          title: "Скопировать ссылку на мероприятие",
+          onClick: () => copyEventLink(event).catch((error) => toast(error.message, "error")),
+        }));
+      }
+      if (canDownloadEventQr(event)) {
+        actions.push(el("button", {
+          class: "btn btn--sm",
+          type: "button",
+          text: "QR",
+          title: "Скачать QR-код мероприятия",
+          onClick: () => downloadEventQr(event).catch((error) => toast(error.message, "error")),
+        }));
+      }
       actions.push(el("button", {
-        class: "btn btn--sm",
+        class: "btn btn--sm btn--danger",
         type: "button",
-        text: "Ссылка",
-        title: "Скопировать ссылку на мероприятие",
-        onClick: () => copyEventLink(event).catch((error) => toast(error.message, "error")),
+        text: "Удалить",
+        onClick: () => deleteEventById(event).catch((error) => toast(error.message, "error")),
       }));
     }
-    if (canDownloadEventQr(event)) {
-      actions.push(el("button", {
-        class: "btn btn--sm",
-        type: "button",
-        text: "QR",
-        title: "Скачать QR-код мероприятия",
-        onClick: () => downloadEventQr(event).catch((error) => toast(error.message, "error")),
-      }));
-    }
-    actions.push(el("button", {
-      class: "btn btn--sm btn--danger",
-      type: "button",
-      text: "Удалить",
-      onClick: () => deleteEventById(event).catch((error) => toast(error.message, "error")),
-    }));
 
     const card = el("article", { class: "admin-event" }, [
       el("div", { class: "admin-event__main" }, [
@@ -320,6 +361,7 @@ function renderEventList(events) {
           announceTag(event),
           expiredTag(event),
           statusChip(event),
+          isPromoter ? el("span", { class: "tag", text: "промоутер" }) : null,
         ]),
         el("div", { class: "admin-event__meta", text: meta }),
       ]),
@@ -415,7 +457,1012 @@ async function downloadEventQr(event) {
   toast("QR-код скачан");
 }
 
-/* -------------------------------------------------------------- ссылки */
+/* ------------------------------------------------------ гостевые списки */
+
+function currentGuestList() {
+  return guestLists.find((item) => item.id === activeGuestListId) || null;
+}
+
+function guestInvitesAvailable() {
+  return Boolean(
+    guestEvent
+    && guestEvent.published
+    && new Date(guestEvent.endsAt).getTime() > Date.now(),
+  );
+}
+
+function setGuestList(list) {
+  const index = guestLists.findIndex((item) => item.id === list.id);
+  if (index >= 0) guestLists[index] = list;
+  else guestLists.push(list);
+}
+
+function guestShareUrl(guest) {
+  return new URL(`/g/${encodeURIComponent(guest.shareToken)}`,
+    window.location.origin).href;
+}
+
+async function shareGuest(guest) {
+  const url = guestShareUrl(guest);
+  const title = `Приглашение на ${guestEvent.title}`;
+  const text = `${guest.name} — покажите QR-код на входе.`;
+  if (navigator.share) {
+    try {
+      await navigator.share({ title, text, url });
+      return;
+    } catch (error) {
+      if (error.name === "AbortError") return;
+    }
+  }
+  await copyToClipboard(url);
+  toast("Ссылка на приглашение скопирована");
+}
+
+function openGuestPass(guest) {
+  window.open(guestShareUrl(guest), "_blank", "noopener");
+}
+
+async function toggleGuest(guest) {
+  if (guest.listIsBlacklist) {
+    toast("Гостя из чёрного списка нельзя отметить как пришедшего", "error");
+    return;
+  }
+  const status = guest.status === "checked_in" ? "invited" : "checked_in";
+  const data = await request(`/api/admin/guests/${guest.id}`, {
+    method: "PATCH",
+    body: { status },
+  });
+  const index = guestItems.findIndex((item) => item.id === guest.id);
+  if (index >= 0) guestItems[index] = data.guest;
+  setGuestList(data.list);
+  renderGuestStats();
+  renderGuestCards();
+  toast(status === "checked_in" ? "Гость отмечен на входе" : "Отметка входа снята");
+}
+
+async function deleteGuest(guest) {
+  if (!confirm(`Удалить гостя «${guest.name}»?`)) return;
+  const data = await request(`/api/admin/guests/${guest.id}`, {
+    method: "DELETE",
+  });
+  guestItems = guestItems.filter((item) => item.id !== guest.id);
+  const list = currentGuestList();
+  if (list) {
+    list.guestCount = Math.max(0, (list.guestCount || 1) - 1);
+  }
+  toast("Гость удалён");
+  await loadGuestItems($("guest-search").value.trim());
+}
+
+function renderGuestStats() {
+  const host = $("guest-stats");
+  clear(host);
+  const list = currentGuestList();
+  if (!list) return;
+  const values = [
+    ["Гостей", list.guestCount],
+    ["Пришло на мероприятие", list.checkedInCount],
+  ];
+  for (const [label, value] of values) {
+    host.append(el("div", { class: "guest-stat" }, [
+      el("strong", { text: String(value || 0) }),
+      el("span", { text: label }),
+    ]));
+  }
+}
+
+function renderGuestListSelect() {
+  const select = $("guest-list-select");
+  clear(select);
+  for (const list of guestLists) {
+    const promoters = list.promoters || [];
+    let text = list.name;
+    if (list.isBlacklist) text += " · чёрный список";
+    else if (promoters.length) text += ` · ${promoters.length} пром.`;
+    select.append(el("option", {
+      value: String(list.id),
+      text,
+    }));
+  }
+  if (activeGuestListId) select.value = String(activeGuestListId);
+}
+
+function promoterChip(promoter, all) {
+  return el("span", {
+    class: "promoter-chip" + (all ? " promoter-chip--all" : ""),
+  }, [
+    el("span", { text: promoter.username }),
+    all
+      ? el("span", { class: "promoter-chip__scope", text: "на всех" })
+      : null,
+    el("button", {
+      class: "promoter-chip__remove",
+      type: "button",
+      text: "×",
+      attrs: {
+        "aria-label": all
+          ? `Убрать ${promoter.username} со всех списков`
+          : `Убрать ${promoter.username} из списка`,
+        title: all ? "Убрать со всех списков" : "Убрать из списка",
+      },
+      onClick: () => {
+        const action = all
+          ? removePromoterFromAllLists(promoter)
+          : removePromoterFromList(promoter);
+        action.catch((error) => toast(error.message, "error"));
+      },
+    }),
+  ]);
+}
+
+function renderGuestPromoters() {
+  const panel = $("guest-promoters-panel");
+  const activeList = currentGuestList();
+  const owner = guestRole === "owner";
+  panel.hidden = !owner;
+  if (!owner) return;
+  const input = $("guest-promoter-input");
+  const scope = $("guest-promoter-scope");
+  const addButton = $("guest-promoter-add");
+  const createButton = $("guest-promoter-create");
+  const chips = $("guest-promoter-chips");
+  const hint = $("guest-promoter-hint");
+  clear(chips);
+  $("guest-promoter-error").hidden = true;
+  $("guest-promoters-scope").textContent = activeList
+    ? `Список: ${activeList.name}`
+    : "Список не выбран";
+  const editable = Boolean(activeList) && !activeList.isBlacklist;
+  input.disabled = !editable;
+  scope.disabled = !editable;
+  addButton.disabled = !editable;
+  createButton.hidden = isPromoter;
+  if (!activeList) {
+    hint.textContent = "Сначала создайте гостевой список.";
+    return;
+  }
+  if (activeList.isBlacklist) {
+    hint.textContent = "Чёрный список не назначается промоутерам.";
+    return;
+  }
+
+  const regularLists = guestLists.filter((item) => !item.isBlacklist);
+  const totalLists = regularLists.length;
+  const counts = new Map();
+  for (const list of regularLists) {
+    for (const promoter of list.promoters || []) {
+      const found = counts.get(promoter.id) || { promoter, count: 0 };
+      found.count += 1;
+      counts.set(promoter.id, found);
+    }
+  }
+  const allPromoters = totalLists > 1
+    ? [...counts.values()]
+      .filter((item) => item.count === totalLists)
+      .map((item) => item.promoter)
+    : [];
+  const allIds = new Set(allPromoters.map((item) => item.id));
+  const specific = (activeList.promoters || [])
+    .filter((item) => !allIds.has(item.id));
+
+  const group = (title, note, promoters, all) => {
+    const head = el("div", { class: "promoter-group__title" }, [
+      el("span", { text: title }),
+      note ? el("span", { class: "muted small", text: note }) : null,
+    ]);
+    const body = el("div", { class: "promoter-group__chips" });
+    if (!promoters.length) {
+      body.append(el("span", {
+        class: "muted small",
+        text: all ? "Пока никого" : "Никого отдельно",
+      }));
+    } else {
+      body.append(...promoters.map((item) => promoterChip(item, all)));
+    }
+    return el("div", {
+      class: "promoter-group" + (all ? " promoter-group--all" : ""),
+    }, [head, body]);
+  };
+
+  if (totalLists > 1) {
+    chips.append(group(
+      "Все списки",
+      "видят все обычные списки",
+      allPromoters,
+      true,
+    ));
+  }
+  chips.append(group(
+    `Только «${activeList.name}»`,
+    "",
+    specific,
+    false,
+  ));
+  hint.textContent = "Промоутеры из группы «Все списки» видят все обычные списки. "
+    + "Ниже — промоутеры только для выбранного списка.";
+}
+
+function renderPromoterSuggestions() {
+  const datalist = $("guest-promoter-datalist");
+  const box = $("guest-promoter-suggestions");
+  clear(datalist);
+  clear(box);
+  if (!guestEvent || guestRole !== "owner") {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  if (!availablePromoters.length) {
+    box.append(el("span", {
+      class: "muted small",
+      text: "Нет доступных промоутеров. Создайте нового.",
+    }));
+    return;
+  }
+  box.append(el("span", {
+    class: "promoter-suggestions__label",
+    text: "Доступные промоутеры:",
+  }));
+  for (const promoter of availablePromoters) {
+    const expiry = promoter.expiresAt
+      ? `до ${formatUserDate(promoter.expiresAt)}`
+      : "бессрочно";
+    const creator = promoter.createdByUsername
+      ? ` · добавил: ${promoter.createdByUsername}`
+      : "";
+    datalist.append(el("option", {
+      value: promoter.username,
+      label: expiry,
+    }));
+    box.append(el("button", {
+      class: "promoter-suggestion",
+      type: "button",
+      text: promoter.username,
+      title: `${expiry}${creator}`,
+      onClick: () => {
+        $("guest-promoter-input").value = promoter.username;
+        $("guest-promoter-input").focus();
+      },
+    }));
+  }
+}
+
+async function loadAvailablePromoters() {
+  availablePromoters = [];
+  if (guestEvent && guestRole === "owner") {
+    try {
+      const data = await request(
+        `/api/admin/events/${guestEvent.id}/promoters`);
+      availablePromoters = data.promoters || [];
+    } catch {
+      availablePromoters = [];
+    }
+  }
+  renderPromoterSuggestions();
+}
+
+function registrationLinkUrl(link) {
+  return new URL(link.path, window.location.origin).href;
+}
+
+function formatRegistrationDate(iso) {
+  if (!iso) return "";
+  const options = {
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  };
+  if (guestEvent && guestEvent.timezone) options.timeZone = guestEvent.timezone;
+  return new Date(iso).toLocaleString("ru-RU", options);
+}
+
+function registrationStatus(link) {
+  if (link.reason === "limit") return ["Лимит", "tag tag--draft"];
+  if (link.reason === "expired") return ["Истекла", "tag tag--expired"];
+  if (link.reason === "event_ended") return ["Событие прошло", "tag tag--expired"];
+  if (link.reason === "closed") return ["Закрыта", "tag tag--expired"];
+  return ["Активна", "tag tag--announce"];
+}
+
+function renderRegistrationLinks() {
+  const panel = $("guest-registration-panel");
+  const list = $("registration-links-list");
+  const owner = guestRole === "owner";
+  panel.hidden = !owner;
+  $("registration-link-new").hidden = !owner;
+  clear(list);
+  if (!owner) return;
+  if (!registrationLinks.length) {
+    list.append(el("div", {
+      class: "registration-links__empty",
+      text: "Ссылок пока нет. Создайте ссылку для гостей.",
+    }));
+    return;
+  }
+  for (const link of registrationLinks) {
+    const [status, statusClass] = registrationStatus(link);
+    const limit = link.maxRegistrations === null
+      ? "без лимита"
+      : `из ${link.maxRegistrations}`;
+    const expiry = link.expiresAt
+      ? `до ${formatRegistrationDate(link.expiresAt)}`
+      : "бессрочно";
+    const actions = [
+      el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "Скопировать",
+        onClick: () => copyRegistrationLink(link)
+          .catch((error) => toast(error.message, "error")),
+      }),
+      el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "Поделиться",
+        onClick: () => shareRegistrationLink(link)
+          .catch((error) => toast(error.message, "error")),
+      }),
+      el("a", {
+        class: "btn btn--sm btn--ghost",
+        href: link.path,
+        target: "_blank",
+        rel: "noopener",
+        text: "Открыть",
+      }),
+    ];
+    if (link.isActive) {
+      actions.push(el("button", {
+        class: "btn btn--sm btn--danger",
+        type: "button",
+        text: "Закрыть",
+        onClick: () => closeRegistrationLink(link)
+          .catch((error) => toast(error.message, "error")),
+      }));
+    } else if (!link.expired && !link.limitReached && !link.eventEnded) {
+      actions.push(el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "Открыть снова",
+        onClick: () => reopenRegistrationLink(link)
+          .catch((error) => toast(error.message, "error")),
+      }));
+    }
+    actions.push(el("button", {
+      class: "btn btn--sm btn--danger",
+      type: "button",
+      text: "Удалить",
+      onClick: () => deleteRegistrationLink(link)
+        .catch((error) => toast(error.message, "error")),
+    }));
+    list.append(el("article", { class: "registration-link" }, [
+      el("div", { class: "registration-link__head" }, [
+        el("span", {
+          class: "registration-link__comment",
+          text: link.comment || "Без комментария",
+        }),
+        el("span", { class: statusClass, text: status }),
+      ]),
+      el("div", {
+        class: "registration-link__meta",
+        text: `Список: ${link.listName} · Регистраций: `
+          + `${link.registrationCount} ${limit} · ${expiry}`,
+      }),
+      el("code", { class: "registration-link__url", text: registrationLinkUrl(link) }),
+      el("div", { class: "registration-link__actions" }, actions),
+    ]));
+  }
+}
+
+async function loadRegistrationLinks() {
+  registrationLinks = [];
+  if (guestEvent && guestRole === "owner") {
+    try {
+      const data = await request(
+        `/api/admin/events/${guestEvent.id}/registration-links`);
+      registrationLinks = data.links || [];
+    } catch {
+      registrationLinks = [];
+    }
+  }
+  renderRegistrationLinks();
+}
+
+function stopRegistrationRefresh() {
+  if (registrationTimer) {
+    clearInterval(registrationTimer);
+    registrationTimer = null;
+  }
+}
+
+function startRegistrationRefresh() {
+  stopRegistrationRefresh();
+  if (!guestEvent || guestRole !== "owner") return;
+  registrationTimer = setInterval(() => {
+    loadRegistrationLinks().catch(() => {});
+  }, 20000);
+}
+
+function toggleRegistrationExpiry() {
+  $("registration-link-expiry-custom").hidden =
+    $("registration-link-expiry").value !== "custom";
+}
+
+function openRegistrationLinkDialog() {
+  if (!guestEvent || guestRole !== "owner") return;
+  const select = $("registration-link-list");
+  clear(select);
+  const regularLists = guestLists.filter((item) => !item.isBlacklist);
+  for (const item of regularLists) {
+    select.append(el("option", { value: String(item.id), text: item.name }));
+  }
+  const active = currentGuestList();
+  if (active && !active.isBlacklist) {
+    select.value = String(active.id);
+  }
+  $("registration-link-form").reset();
+  $("registration-link-expiry").value = "start+1";
+  $("registration-link-error").hidden = true;
+  toggleRegistrationExpiry();
+  $("registration-link-dialog").showModal();
+  $("registration-link-comment").focus();
+}
+
+async function createRegistrationLink(event) {
+  event.preventDefault();
+  if (!guestEvent) return;
+  const listId = Number($("registration-link-list").value);
+  if (!Number.isInteger(listId) || listId <= 0) {
+    const box = $("registration-link-error");
+    box.textContent = "Выберите гостевой список.";
+    box.hidden = false;
+    return;
+  }
+  const rawLimit = $("registration-link-limit").value.trim();
+  const maxRegistrations = rawLimit ? Number(rawLimit) : null;
+  if (maxRegistrations !== null
+      && (!Number.isInteger(maxRegistrations) || maxRegistrations < 1)) {
+    const box = $("registration-link-error");
+    box.textContent = "Лимит должен быть положительным числом.";
+    box.hidden = false;
+    return;
+  }
+  const expiryMode = $("registration-link-expiry").value;
+  const body = {
+    listId,
+    comment: $("registration-link-comment").value.trim(),
+    expiryMode,
+    maxRegistrations,
+  };
+  if (expiryMode === "custom") {
+    body.expiresAtLocal = $("registration-link-expires").value;
+  }
+  const button = $("registration-link-form").querySelector('button[type="submit"]');
+  setBusy(button, true);
+  try {
+    await request(`/api/admin/events/${guestEvent.id}/registration-links`, {
+      method: "POST",
+      body,
+    });
+    $("registration-link-dialog").close();
+    toast("Ссылка на саморегистрацию создана");
+    await loadRegistrationLinks();
+  } catch (error) {
+    const box = $("registration-link-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function copyRegistrationLink(link) {
+  await copyToClipboard(registrationLinkUrl(link));
+  toast("Ссылка скопирована");
+}
+
+async function shareRegistrationLink(link) {
+  const url = registrationLinkUrl(link);
+  const title = `Регистрация — ${guestEvent ? guestEvent.title : "LineUP"}`;
+  if (navigator.share) {
+    try {
+      await navigator.share({ title, url });
+      return;
+    } catch (error) {
+      if (error.name === "AbortError") return;
+    }
+  }
+  await copyToClipboard(url);
+  toast("Ссылка скопирована");
+}
+
+async function closeRegistrationLink(link) {
+  await request(`/api/admin/registration-links/${link.id}`, {
+    method: "PATCH",
+    body: { isActive: false },
+  });
+  toast("Регистрация закрыта");
+  await loadRegistrationLinks();
+}
+
+async function reopenRegistrationLink(link) {
+  await request(`/api/admin/registration-links/${link.id}`, {
+    method: "PATCH",
+    body: { isActive: true },
+  });
+  toast("Регистрация открыта");
+  await loadRegistrationLinks();
+}
+
+async function deleteRegistrationLink(link) {
+  const suffix = link.registrationCount
+    ? ` Зарегистрированные гости (${link.registrationCount}) останутся в списке.`
+    : "";
+  if (!confirm(
+    `Удалить ссылку «${link.comment || "Без комментария"}»?${suffix}`,
+  )) return;
+  await request(`/api/admin/registration-links/${link.id}`, {
+    method: "DELETE",
+  });
+  toast("Ссылка удалена");
+  await loadRegistrationLinks();
+}
+
+function renderGuestHeader() {
+  if (!guestEvent) return;
+  $("guests-title").textContent = guestEvent.title;
+  $("guests-sub").textContent = formatRangeShort(
+    guestEvent.startsAt, guestEvent.endsAt, guestEvent.timezone);
+  const activeList = currentGuestList();
+  $("guests-new-list").hidden = guestRole !== "owner";
+  $("guests-open-event").hidden = guestRole !== "owner";
+  $("guests-door-link").hidden = guestRole !== "owner" || !guestInvitesAvailable();
+  $("guest-list-delete").hidden = guestRole !== "owner" || !activeList
+    || activeList.isBlacklist;
+  renderGuestPromoters();
+  const available = guestInvitesAvailable();
+  $("guest-add-form").hidden = !available;
+  $("guest-add-title").textContent = activeList && activeList.isBlacklist
+    ? "Добавить в чёрный список"
+    : "Добавить гостя";
+  $("guest-list-role").textContent = !available
+    ? "Мероприятие завершено — приглашения недоступны"
+    : activeList && activeList.isBlacklist
+      ? "Гости отсюда не получают приглашения"
+      : (guestRole === "promoter" ? "Режим промоутера" : "");
+}
+
+function renderGuestCards() {
+  const host = $("guest-list");
+  clear(host);
+  $("guest-count").textContent = guestItems.length
+    ? `${guestItems.length} ${plural(guestItems.length, "гость", "гостя", "гостей")}`
+    : "";
+  if (!guestItems.length) {
+    host.append(el("div", {
+      class: "guest-list-empty",
+      text: currentGuestList()
+        ? "В списке пока нет гостей."
+        : "Создайте гостевой список, чтобы добавлять гостей.",
+    }));
+    return;
+  }
+  for (const guest of guestItems) {
+    const checked = guest.status === "checked_in";
+    const blacklisted = Boolean(
+      guest.listIsBlacklist || (currentGuestList() && currentGuestList().isBlacklist));
+    const meta = [
+      guest.phone,
+      guest.tableName ? `Стол: ${guest.tableName}` : "",
+    ].filter(Boolean).join(" · ");
+    const card = el("article", {
+      class: "guest-card" + (checked ? " is-checked" : "")
+        + (blacklisted ? " is-blacklisted" : ""),
+    }, [
+      el("div", { class: "guest-card__main" }, [
+        el("div", { class: "guest-card__name" }, [
+          el("span", { text: guest.name }),
+          el("span", {
+            class: "guest-status"
+              + (blacklisted ? " guest-status--blacklist" : "")
+              + (checked && !blacklisted ? " guest-status--in" : ""),
+            text: blacklisted ? "чёрный список" : checked ? "пришёл" : "гость",
+          }),
+        ]),
+        meta ? el("div", { class: "guest-card__meta", text: meta }) : null,
+        guest.notes
+          ? el("div", { class: "guest-card__notes", text: guest.notes })
+          : null,
+      ]),
+      el("div", { class: "guest-card__actions" }, [
+        el("button", {
+          class: "btn btn--sm",
+          type: "button",
+          text: "Изменить",
+          onClick: () => openGuestEdit(guest),
+        }),
+        ...(guestInvitesAvailable() && !blacklisted ? [
+          el("button", {
+            class: "btn btn--primary btn--sm",
+            type: "button",
+            text: "Поделиться",
+            onClick: () => shareGuest(guest).catch((error) => toast(error.message, "error")),
+          }),
+          el("button", {
+            class: "btn btn--sm",
+            type: "button",
+            text: "QR",
+            title: "Открыть приглашение с QR-кодом",
+            onClick: () => openGuestPass(guest),
+          }),
+          el("button", {
+            class: "btn btn--sm" + (checked ? "" : " btn--ghost"),
+            type: "button",
+            text: checked ? "Вернуть" : "Пришёл",
+            onClick: () => toggleGuest(guest).catch((error) => toast(error.message, "error")),
+          }),
+        ] : []),
+        el("button", {
+          class: "btn btn--sm btn--danger btn--icon",
+          type: "button",
+          text: "✕",
+          attrs: { "aria-label": `Удалить гостя ${guest.name}`, title: "Удалить гостя" },
+          onClick: () => deleteGuest(guest).catch((error) => toast(error.message, "error")),
+        }),
+      ]),
+    ]);
+    host.append(card);
+  }
+}
+
+function renderGuestView() {
+  renderGuestHeader();
+  renderGuestListSelect();
+  renderGuestStats();
+  renderGuestCards();
+  renderRegistrationLinks();
+}
+
+async function loadGuestItems(query = "") {
+  if (!activeGuestListId) {
+    guestItems = [];
+    renderGuestView();
+    return;
+  }
+  const suffix = query ? `?q=${encodeURIComponent(query)}` : "";
+  const data = await request(`/api/admin/guest-lists/${activeGuestListId}/guests${suffix}`);
+  guestItems = data.guests || [];
+  if (data.list) setGuestList(data.list);
+  renderGuestView();
+}
+
+async function reloadGuestLists(query = "") {
+  if (!guestEvent) return;
+  const data = await request(`/api/admin/events/${guestEvent.id}/guest-lists`);
+  guestEvent = data.event;
+  guestRole = data.role || "owner";
+  guestLists = data.lists || [];
+  if (!guestLists.some((item) => item.id === activeGuestListId)) {
+    activeGuestListId = guestLists.length ? guestLists[0].id : null;
+  }
+  renderGuestView();
+  await loadGuestItems(query);
+}
+
+function showPromoterError(message) {
+  const box = $("guest-promoter-error");
+  box.textContent = message;
+  box.hidden = false;
+}
+
+async function addPromoter() {
+  if (!guestEvent || guestRole !== "owner") return;
+  const input = $("guest-promoter-input");
+  const username = input.value.trim();
+  if (!username) {
+    showPromoterError("Укажите логин промоутера.");
+    input.focus();
+    return;
+  }
+  const activeList = currentGuestList();
+  const scope = $("guest-promoter-scope").value;
+  const body = { username };
+  if (scope !== "all") {
+    if (!activeList || activeList.isBlacklist) {
+      showPromoterError("Выберите обычный гостевой список.");
+      return;
+    }
+    body.listId = activeList.id;
+  }
+  const button = $("guest-promoter-add");
+  setBusy(button, true);
+  $("guest-promoter-error").hidden = true;
+  try {
+    const data = await request(`/api/admin/events/${guestEvent.id}/promoters`, {
+      method: "POST",
+      body,
+    });
+    input.value = "";
+    toast(scope === "all"
+      ? `Промоутер добавлен во все списки (${data.lists})`
+      : "Промоутер добавлен в список");
+    await reloadGuestLists($("guest-search").value.trim());
+  } catch (error) {
+    showPromoterError(error.message);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function removePromoterFromList(promoter) {
+  const activeList = currentGuestList();
+  if (!activeList) return;
+  await request(
+    `/api/admin/guest-lists/${activeList.id}/promoters/${promoter.id}`,
+    { method: "DELETE" },
+  );
+  toast("Промоутер убран из списка");
+  await reloadGuestLists($("guest-search").value.trim());
+}
+
+async function removePromoterFromAllLists(promoter) {
+  if (!guestEvent) return;
+  if (!confirm(`Убрать «${promoter.username}» со всех списков?`)) return;
+  await request(
+    `/api/admin/events/${guestEvent.id}/promoters/${promoter.id}`,
+    { method: "DELETE" },
+  );
+  toast("Промоутер убран со всех списков");
+  await reloadGuestLists($("guest-search").value.trim());
+}
+
+function renderEditGuestLists(selectedId) {
+  const select = $("edit-guest-list");
+  clear(select);
+  for (const list of guestLists) {
+    let text = list.name;
+    if (list.isBlacklist) text += " · чёрный список";
+    select.append(el("option", { value: String(list.id), text }));
+  }
+  if (selectedId) select.value = String(selectedId);
+}
+
+function openGuestEdit(guest) {
+  editingGuestId = guest.id;
+  $("edit-guest-name").value = guest.name || "";
+  $("edit-guest-phone").value = guest.phone || "";
+  $("edit-guest-table").value = guest.tableName || "";
+  $("edit-guest-notes").value = guest.notes || "";
+  renderEditGuestLists(guest.listId);
+  $("guest-edit-error").hidden = true;
+  $("guest-edit-dialog").showModal();
+  $("edit-guest-name").focus();
+}
+
+async function saveGuestEdit(event) {
+  event.preventDefault();
+  if (!editingGuestId) return;
+  const name = $("edit-guest-name").value.trim();
+  if (!name) {
+    const box = $("guest-edit-error");
+    box.textContent = "Укажите имя гостя.";
+    box.hidden = false;
+    $("edit-guest-name").focus();
+    return;
+  }
+  const listId = Number($("edit-guest-list").value);
+  if (!Number.isInteger(listId) || listId <= 0) {
+    const box = $("guest-edit-error");
+    box.textContent = "Выберите гостевой список.";
+    box.hidden = false;
+    return;
+  }
+  const button = $("guest-edit-form").querySelector('button[type="submit"]');
+  setBusy(button, true);
+  try {
+    await request(`/api/admin/guests/${editingGuestId}`, {
+      method: "PATCH",
+      body: {
+        name,
+        phone: $("edit-guest-phone").value.trim(),
+        tableName: $("edit-guest-table").value.trim(),
+        notes: $("edit-guest-notes").value.trim(),
+        listId,
+      },
+    });
+    $("guest-edit-dialog").close();
+    editingGuestId = null;
+    toast("Данные гостя сохранены");
+    await reloadGuestLists($("guest-search").value.trim());
+  } catch (error) {
+    const box = $("guest-edit-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function openGuests(eventId) {
+  const data = await request(`/api/admin/events/${eventId}/guest-lists`);
+  guestEvent = data.event;
+  guestRole = data.role || "owner";
+  guestLists = data.lists || [];
+  activeGuestListId = guestLists.length ? guestLists[0].id : null;
+  $("guest-search").value = "";
+  showView("guests");
+  await loadAvailablePromoters();
+  await loadRegistrationLinks();
+  startRegistrationRefresh();
+  renderGuestView();
+  await loadGuestItems();
+  window.scrollTo({ top: 0 });
+}
+
+async function createGuest(event) {
+  event.preventDefault();
+  if (!activeGuestListId) {
+    toast("Сначала создайте гостевой список", "error");
+    return;
+  }
+  const name = $("guest-name").value.trim();
+  if (!name) {
+    toast("Укажите имя гостя", "error");
+    $("guest-name").focus();
+    return;
+  }
+  const button = $("guest-add-form").querySelector('button[type="submit"]');
+  setBusy(button, true);
+  try {
+    const data = await request(`/api/admin/guest-lists/${activeGuestListId}/guests`, {
+      method: "POST",
+      body: {
+        name,
+        phone: $("guest-phone").value.trim(),
+        tableName: $("guest-table").value.trim(),
+        notes: $("guest-notes").value.trim(),
+      },
+    });
+    if (data.list) setGuestList(data.list);
+    $("guest-name").value = "";
+    $("guest-phone").value = "";
+    $("guest-table").value = "";
+    $("guest-notes").value = "";
+    await loadGuestItems($("guest-search").value.trim());
+    toast("Гость добавлен — можно отправить приглашение");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function deleteGuestList() {
+  const list = currentGuestList();
+  if (!list) return;
+  if (list.isBlacklist) {
+    toast("Чёрный список удалить нельзя", "error");
+    return;
+  }
+  if (!confirm(`Удалить список «${list.name}» и всех его гостей?`)) return;
+  await request(`/api/admin/guest-lists/${list.id}`, { method: "DELETE" });
+  activeGuestListId = null;
+  await reloadGuestLists();
+  toast("Гостевой список удалён");
+}
+
+function openGuestListDialog() {
+  if (!guestEvent || guestRole !== "owner") return;
+  $("guest-list-form").reset();
+  $("guest-list-error").hidden = true;
+  $("guest-list-dialog").showModal();
+  $("guest-list-name").focus();
+}
+
+function doorLinkUrl() {
+  return doorLink
+    ? new URL(doorLink.path, window.location.origin).href
+    : "";
+}
+
+function renderDoorLink() {
+  const ready = Boolean(doorLink);
+  $("door-link-empty").hidden = ready;
+  $("door-link-ready").hidden = !ready;
+  if (ready) $("door-link-url").value = doorLinkUrl();
+  $("door-link-error").hidden = true;
+}
+
+async function openDoorLinkDialog() {
+  if (!guestEvent || guestRole !== "owner") return;
+  $("door-link-error").hidden = true;
+  $("door-link-dialog").showModal();
+  try {
+    const data = await request(`/api/admin/events/${guestEvent.id}/door-link`);
+    doorLink = data.link || null;
+    renderDoorLink();
+  } catch (error) {
+    const box = $("door-link-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  }
+}
+
+async function createDoorLink() {
+  if (!guestEvent) return;
+  try {
+    const data = await request(`/api/admin/events/${guestEvent.id}/door-link`, {
+      method: "POST",
+    });
+    doorLink = data.link;
+    renderDoorLink();
+    toast("Ссылка для персонала создана");
+  } catch (error) {
+    const box = $("door-link-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  }
+}
+
+async function revokeDoorLink() {
+  if (!guestEvent || !doorLink) return;
+  if (!confirm("Отозвать ссылку для персонала? Старая ссылка перестанет работать.")) return;
+  try {
+    await request(`/api/admin/events/${guestEvent.id}/door-link`, {
+      method: "DELETE",
+    });
+    doorLink = null;
+    renderDoorLink();
+    toast("Ссылка для персонала отозвана");
+  } catch (error) {
+    const box = $("door-link-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  }
+}
+
+async function shareDoorLink() {
+  const url = doorLinkUrl();
+  if (!url) return;
+  const title = `Проверка гостей — ${guestEvent.title}`;
+  if (navigator.share) {
+    try {
+      await navigator.share({ title, url });
+      return;
+    } catch (error) {
+      if (error.name === "AbortError") return;
+    }
+  }
+  await copyToClipboard(url);
+  toast("Ссылка для персонала скопирована");
+}
+
+async function createGuestList(event) {
+  event.preventDefault();
+  if (!guestEvent || guestRole !== "owner") return;
+  const name = $("guest-list-name").value.trim();
+  if (!name) {
+    toast("Укажите название списка", "error");
+    return;
+  }
+  const button = $("guest-list-form").querySelector('button[type="submit"]');
+  setBusy(button, true);
+  try {
+    const data = await request(`/api/admin/events/${guestEvent.id}/guest-lists`, {
+      method: "POST",
+      body: { name },
+    });
+    activeGuestListId = data.list.id;
+    $("guest-list-dialog").close();
+    await reloadGuestLists();
+    toast("Гостевой список создан");
+  } catch (error) {
+    const box = $("guest-list-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 
 function linkRow(link = {}) {
   const title = el("input", {
@@ -524,6 +1571,7 @@ function fillEventForm() {
   $("event-sub").textContent = subParts.filter(Boolean).join(" · ");
   $("delete-event").hidden = false;
   $("shift-event").hidden = false;
+  $("event-guests-btn").hidden = false;
 
   const publicLink = $("open-public");
   publicLink.hidden = !current.published || current.publiclyVisible === false;
@@ -1030,6 +2078,7 @@ function newEvent() {
   $("event-sub").textContent = "Заполните данные и сохраните — затем добавьте залы.";
   $("delete-event").hidden = true;
   $("shift-event").hidden = true;
+  $("event-guests-btn").hidden = true;
   $("open-public").hidden = true;
   $("copy-event-link").hidden = true;
   $("download-qr").hidden = true;
@@ -1226,18 +2275,37 @@ async function loadPerformers() {
 
 /* ------------------------------------------------------- администраторы */
 
+function formatUserDate(value) {
+  if (!value) return "";
+  const [year, month, day] = value.split("-");
+  return day && month && year ? `${day}.${month}.${year}` : value;
+}
+
+function canManageUser(user) {
+  if (user.isSuper) return false;
+  return isSuper
+    || (user.isPromoter && user.createdByUsername === username);
+}
+
 function renderUsers(users) {
   clear(usersList);
+  const words = isSuper
+    ? ["участник", "участника", "участников"]
+    : ["промоутер", "промоутера", "промоутеров"];
   $("users-count").textContent = `${users.length} ${plural(
-    users.length,
-    "администратор",
-    "администратора",
-    "администраторов",
-  )}`;
+    users.length, ...words)}`;
+
+  if (!users.length) {
+    usersList.append(el("div", {
+      class: "empty",
+      text: isSuper ? "Пользователей пока нет." : "Вы ещё не создали промоутеров.",
+    }));
+    return;
+  }
 
   for (const user of users) {
     const actions = [];
-    if (!user.isSuper) {
+    if (canManageUser(user)) {
       actions.push(
         el("button", {
           class: "btn btn--sm",
@@ -1256,21 +2324,69 @@ function renderUsers(users) {
 
     const name = [el("span", { text: user.username })];
     if (user.isSuper) name.push(el("span", { class: "tag", text: "главный" }));
+    if (user.isPromoter) {
+      name.push(el("span", { class: "tag tag--promoter", text: "промоутер" }));
+    }
+    if (user.expired) {
+      name.push(el("span", { class: "tag tag--expired", text: "истёк" }));
+    }
     if (user.username === username) {
       name.push(el("span", { class: "muted small", text: "это вы" }));
+    }
+
+    const meta = [];
+    if (user.isPromoter) {
+      meta.push(user.createdByUsername
+        ? `Добавил: ${user.createdByUsername}`
+        : "Добавил: —");
+      meta.push(user.expiresAt
+        ? `Действует до ${formatUserDate(user.expiresAt)}`
+        : "Бессрочно");
+    } else if (user.createdByUsername) {
+      meta.push(`Добавил: ${user.createdByUsername}`);
     }
 
     usersList.append(
       el("div", { class: "user-row" }, [
         el("div", { class: "user-row__name" }, name),
         el("div", { class: "user-row__actions" }, actions),
+        meta.length
+          ? el("div", { class: "user-row__meta", text: meta.join(" · ") })
+          : null,
       ]),
     );
   }
 }
 
-async function openUsers() {
+function toggleExpiryField() {
+  const promoter = $("u-role").value === "promoter";
+  $("u-expiry-field").hidden = !promoter;
+  if (!promoter) $("u-expires").value = "";
+}
+
+function configureUsersView({ createPromoter = false } = {}) {
+  const promoterForm = !isSuper || createPromoter;
+  $("users-title").textContent = isSuper
+    ? "Администраторы и промоутеры"
+    : "Промоутеры";
+  $("users-sub").textContent = isSuper
+    ? "Главный администратор видит всех и управляет любыми учётными записями."
+    : "Вы можете создавать промоутеров и удалять только тех, кого добавили сами.";
+  $("users-list-title").textContent = isSuper
+    ? "Все пользователи"
+    : "Мои промоутеры";
+  $("add-user-title").textContent = isSuper
+    ? "Новый пользователь"
+    : "Новый промоутер";
+  $("u-role-field").hidden = !isSuper;
+  $("u-role").value = promoterForm ? "promoter" : "admin";
+  $("u-expires").value = "";
+  toggleExpiryField();
+}
+
+async function openUsers(options = {}) {
   const data = await request("/api/admin/users");
+  configureUsersView(options);
   renderUsers(data.users);
   showView("users");
   window.scrollTo({ top: 0 });
@@ -1286,10 +2402,11 @@ function openUserPassword(user) {
 }
 
 async function deleteUser(user) {
-  if (!confirm(`Удалить администратора «${user.username}»?`)) return;
+  const kind = user.isPromoter ? "промоутера" : "администратора";
+  if (!confirm(`Удалить ${kind} «${user.username}»?`)) return;
   try {
     await request(`/api/admin/users/${user.id}`, { method: "DELETE" });
-    toast("Администратор удалён");
+    toast(user.isPromoter ? "Промоутер удалён" : "Администратор удалён");
     await openUsers();
   } catch (error) {
     toast(error.message, "error");
@@ -1807,6 +2924,21 @@ const AUDIT_LABELS = {
   "site.logo": "Изменил логотип сайта",
   "site.copyright": "Изменил копирайт",
   "site.theme": "Изменил оформление сайта",
+  "guest_list.create": "Создал гостевой список",
+  "guest_list.update": "Изменил гостевой список",
+  "guest_list.delete": "Удалил гостевой список",
+  "guest_list.promoter.add": "Назначил промоутера",
+  "guest_list.promoter.remove": "Убрал промоутера",
+  "registration.link.create": "Создал ссылку на регистрацию",
+  "registration.link.update": "Изменил ссылку на регистрацию",
+  "registration.link.delete": "Удалил ссылку на регистрацию",
+  "guest.registration": "Гость зарегистрировался по ссылке",
+  "guest.create": "Добавил гостя",
+  "guest.update": "Изменил гостя",
+  "guest.checkin": "Отметил вход гостя",
+  "guest.return": "Снял отметку входа",
+  "guest.delete": "Удалил гостя",
+  "door.link": "Обновил ссылку для персонала",
   "user.create": "Добавил администратора",
   "user.update": "Сменил пароль администратора",
   "user.delete": "Удалил администратора",
@@ -1887,6 +3019,7 @@ loginForm.addEventListener("submit", async (event) => {
     csrf = data.csrfToken;
     username = data.user.username;
     isSuper = Boolean(data.user.isSuper);
+    isPromoter = Boolean(data.user.isPromoter);
     $("who").textContent = username;
     $("login-pass").value = "";
     await openList();
@@ -2005,6 +3138,90 @@ $("download-qr").addEventListener("click", () => {
   downloadEventQr(current).catch((error) => toast(error.message, "error"));
 });
 $("shift-event").addEventListener("click", openShiftDialog);
+$("event-guests-btn").addEventListener("click", () => {
+  if (!current) return;
+  openGuests(current.id).catch((error) => toast(error.message, "error"));
+});
+$("guests-back").addEventListener("click", () => {
+  openList().catch((error) => toast(error.message, "error"));
+});
+$("guests-open-event").addEventListener("click", () => {
+  if (guestEvent) openEvent(guestEvent.id).catch((error) => toast(error.message, "error"));
+});
+$("guests-new-list").addEventListener("click", openGuestListDialog);
+$("guest-list-delete").addEventListener("click", () => {
+  deleteGuestList().catch((error) => toast(error.message, "error"));
+});
+$("guests-door-link").addEventListener("click", () => {
+  openDoorLinkDialog().catch((error) => toast(error.message, "error"));
+});
+$("door-link-create").addEventListener("click", () => {
+  createDoorLink().catch((error) => toast(error.message, "error"));
+});
+$("door-link-copy").addEventListener("click", () => {
+  copyToClipboard(doorLinkUrl())
+    .then(() => toast("Ссылка для персонала скопирована"))
+    .catch((error) => toast(error.message, "error"));
+});
+$("door-link-share").addEventListener("click", () => {
+  shareDoorLink().catch((error) => toast(error.message, "error"));
+});
+$("door-link-rotate").addEventListener("click", () => {
+  if (confirm("Обновить ссылку? Старая ссылка перестанет работать.")) {
+    createDoorLink().catch((error) => toast(error.message, "error"));
+  }
+});
+$("door-link-revoke").addEventListener("click", () => {
+  revokeDoorLink().catch((error) => toast(error.message, "error"));
+});
+$("door-link-close").addEventListener("click", () => $("door-link-dialog").close());
+$("guest-promoter-add").addEventListener("click", () => {
+  addPromoter().catch((error) => toast(error.message, "error"));
+});
+$("guest-promoter-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    addPromoter().catch((error) => toast(error.message, "error"));
+  }
+});
+$("guest-promoter-create").addEventListener("click", async () => {
+  const desired = $("guest-promoter-input").value.trim();
+  try {
+    await openUsers({ createPromoter: true });
+    if (desired) $("u-username").value = desired;
+    $("u-username").focus();
+    $("u-username").scrollIntoView({ block: "center" });
+  } catch (error) {
+    toast(error.message, "error");
+  }
+});
+$("guest-edit-cancel").addEventListener("click", () => {
+  $("guest-edit-dialog").close();
+  editingGuestId = null;
+});
+$("guest-edit-form").addEventListener("submit", saveGuestEdit);
+$("registration-link-new").addEventListener("click", openRegistrationLinkDialog);
+$("registration-link-form").addEventListener("submit", createRegistrationLink);
+$("registration-link-cancel").addEventListener(
+  "click", () => $("registration-link-dialog").close());
+$("registration-link-expiry").addEventListener(
+  "change", toggleRegistrationExpiry);
+$("guest-list-cancel").addEventListener("click", () => $("guest-list-dialog").close());
+$("guest-list-form").addEventListener("submit", createGuestList);
+$("guest-add-form").addEventListener("submit", createGuest);
+$("guest-list-select").addEventListener("change", () => {
+  activeGuestListId = Number($("guest-list-select").value) || null;
+  guestItems = [];
+  loadGuestItems($("guest-search").value.trim())
+    .catch((error) => toast(error.message, "error"));
+});
+$("guest-search").addEventListener("input", () => {
+  if (guestSearchTimer) clearTimeout(guestSearchTimer);
+  guestSearchTimer = setTimeout(() => {
+    loadGuestItems($("guest-search").value.trim())
+      .catch((error) => toast(error.message, "error"));
+  }, 220);
+});
 $("shift-cancel").addEventListener("click", () => shiftDialog.close());
 shiftForm.addEventListener("submit", submitShift);
 $("shift-starts").addEventListener("input", updateShiftHint);
@@ -2099,6 +3316,8 @@ addUserForm.addEventListener("submit", async (event) => {
   addUserError.hidden = true;
   const login = $("u-username").value.trim();
   const password = $("u-password").value;
+  const promoter = !isSuper || $("u-role").value === "promoter";
+  const expiresAt = promoter ? $("u-expires").value : "";
   if (!login || !password) {
     addUserError.hidden = false;
     addUserError.textContent = "Введите логин и пароль.";
@@ -2114,10 +3333,15 @@ addUserForm.addEventListener("submit", async (event) => {
   try {
     await request("/api/admin/users", {
       method: "POST",
-      body: { username: login, password },
+      body: {
+        username: login,
+        password,
+        isPromoter: promoter,
+        expiresAt: expiresAt || null,
+      },
     });
     addUserForm.reset();
-    toast("Администратор добавлен");
+    toast(promoter ? "Промоутер добавлен" : "Администратор добавлен");
     await openUsers();
   } catch (error) {
     addUserError.hidden = false;
@@ -2126,6 +3350,8 @@ addUserForm.addEventListener("submit", async (event) => {
     setBusy(submit, false);
   }
 });
+
+$("u-role").addEventListener("change", toggleExpiryField);
 
 $("cancel-user-password").addEventListener("click", () => userDialog.close());
 
@@ -2169,6 +3395,7 @@ async function boot() {
     csrf = session.csrfToken;
     username = session.user.username;
     isSuper = Boolean(session.user.isSuper);
+    isPromoter = Boolean(session.user.isPromoter);
     await openList();
   } catch (error) {
     showLogin({
