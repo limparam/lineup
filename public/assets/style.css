@@ -3040,6 +3040,56 @@ dialog .stack {
   margin-bottom: 16px;
 }
 
+.door-offline-status {
+  margin: 0 0 16px;
+  padding: 9px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.door-offline-status.is-online {
+  color: var(--muted);
+}
+
+.door-offline-status.is-pending {
+  border-color: rgba(255, 196, 92, 0.45);
+  background: rgba(255, 196, 92, 0.08);
+  color: #ffd07a;
+  font-weight: 600;
+}
+
+.door-offline-status.is-offline {
+  border-color: rgba(255, 122, 122, 0.45);
+  background: rgba(255, 122, 122, 0.08);
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.door-help {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.015);
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.door-help summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.door-help p {
+  margin: 8px 0 0;
+}
+
 .door__panel {
   display: grid;
   gap: 14px;
@@ -3239,7 +3289,7 @@ dialog .stack {
   }
 }
 
-/* ------------------------------------------------------- саморегистрация */
+/* ------------------------------------------------------- пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ */
 
 .guest-registration-panel {
   margin-bottom: 18px;

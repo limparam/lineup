@@ -157,6 +157,18 @@ CREATE TABLE IF NOT EXISTS guests (
     updated_at     TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS door_sync_operations (
+    operation_id TEXT PRIMARY KEY,
+    event_id     INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    guest_id     INTEGER REFERENCES guests(id) ON DELETE SET NULL,
+    action       TEXT NOT NULL,
+    client_at    TEXT,
+    applied_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_door_sync_event
+    ON door_sync_operations(event_id, applied_at);
+
 CREATE TABLE IF NOT EXISTS event_door_links (
     event_id   INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
     token      TEXT NOT NULL UNIQUE,

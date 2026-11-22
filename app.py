@@ -1232,6 +1232,11 @@ def guest_qr(req, token):
         conn.close()
 
 
+@route(r"/door-sw\.js")
+def page_door_sw(req):
+    return _serve_static(req, "door-sw.js", cache="no-cache")
+
+
 @route(r"/door/([A-Za-z0-9_-]{16,80})")
 def page_door(req, token):
     resp = _serve_static(req, "door.html", cache="no-cache")
@@ -1246,6 +1251,16 @@ def api_door_event(req, token):
     try:
         row = _door_link_row(conn, token)
         return json_response(_door_event_json(conn, row))
+    finally:
+        conn.close()
+
+
+@route(r"/api/door/([A-Za-z0-9_-]{16,80})/snapshot")
+def api_door_snapshot(req, token):
+    conn = db.connect()
+    try:
+        row = _door_link_row(conn, token)
+        return json_response(_door_snapshot_json(conn, row))
     finally:
         conn.close()
 
@@ -1367,6 +1382,161 @@ def api_door_undo(req, token):
         return json_response({
             "guest": _door_guest_json(updated),
             "stats": _door_event_stats(conn, door["link_event_id"]),
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/door/([A-Za-z0-9_-]{16,80})/sync", methods=("POST",))
+def api_door_sync(req, token):
+    data = req.json()
+    operations = data.get("operations")
+    if not isinstance(operations, list):
+        raise APIError(400, "validation", "Передайте список действий.")
+    if len(operations) > 500:
+        raise APIError(400, "validation", "Слишком много действий за раз.")
+    conn = db.connect()
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            door = _door_link_row(conn, token)
+            event_id = door["link_event_id"]
+            now = timeutil.iso_now()
+            results = []
+            updated = {}
+            for raw in operations:
+                if not isinstance(raw, dict):
+                    continue
+                op_id = str(raw.get("id") or "").strip()[:100]
+                action = raw.get("action")
+                guest_id = raw.get("guestId")
+                if (not op_id or action not in ("checkin", "undo")
+                        or isinstance(guest_id, bool)
+                        or not isinstance(guest_id, int)):
+                    results.append({
+                        "id": op_id or "",
+                        "status": "conflict",
+                        "message": "Некорректная операция.",
+                    })
+                    continue
+                existing = conn.execute(
+                    "SELECT guest_id, action FROM door_sync_operations "
+                    "WHERE operation_id = ?", (op_id,)
+                ).fetchone()
+                if existing:
+                    item = {"id": op_id, "status": "duplicate"}
+                    if existing["guest_id"]:
+                        current = _door_guest_row(
+                            conn, event_id, existing["guest_id"])
+                        item["guest"] = _door_guest_json(current)
+                        updated[current["id"]] = _door_guest_json(current)
+                    results.append(item)
+                    continue
+                guest = conn.execute(
+                    "SELECT g.*, gl.name AS list_name, gl.is_blacklist "
+                    "FROM guests g JOIN guest_lists gl ON gl.id = g.list_id "
+                    "WHERE g.id = ? AND g.event_id = ?",
+                    (guest_id, event_id),
+                ).fetchone()
+                if not guest:
+                    conn.execute(
+                        "INSERT INTO door_sync_operations (operation_id, "
+                        "event_id, guest_id, action, client_at, applied_at) "
+                        "VALUES (?, ?, NULL, ?, ?, ?)",
+                        (op_id, event_id, action, str(raw.get("at") or "")[:40],
+                         now),
+                    )
+                    results.append({
+                        "id": op_id,
+                        "status": "conflict",
+                        "message": "Гость не найден.",
+                    })
+                    continue
+                status = "applied"
+                message = ""
+                if action == "checkin":
+                    match = _blacklist_match(conn, event_id, guest)
+                    if match:
+                        status = "conflict"
+                        message = "Гость в чёрном списке."
+                        results.append({
+                            "id": op_id,
+                            "status": status,
+                            "message": message,
+                            "guest": _door_guest_json(guest),
+                            "blacklistMatch": _door_guest_json(match),
+                        })
+                        conn.execute(
+                            "INSERT INTO door_sync_operations (operation_id, "
+                            "event_id, guest_id, action, client_at, applied_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (op_id, event_id, guest["id"], action,
+                             str(raw.get("at") or "")[:40], now),
+                        )
+                        continue
+                    if guest["status"] != "checked_in":
+                        client_at = now
+                        raw_at = raw.get("at")
+                        if isinstance(raw_at, str) and raw_at.strip():
+                            try:
+                                client_at = timeutil.to_iso(
+                                    timeutil.parse_iso(raw_at.strip()))
+                            except Exception:
+                                try:
+                                    clean_at = re.sub(
+                                        r"\.\d+Z$", "Z", raw_at.strip())
+                                    client_at = timeutil.to_iso(
+                                        timeutil.parse_iso(clean_at))
+                                except Exception:
+                                    client_at = now
+                        conn.execute(
+                            "UPDATE guests SET status = 'checked_in', "
+                            "checked_in_at = ?, checked_in_by = NULL, "
+                            "updated_at = ? WHERE id = ? AND event_id = ?",
+                            (client_at, now, guest["id"], event_id),
+                        )
+                        _audit(conn, {"user_id": None, "username": "door-offline"},
+                               "guest.checkin", entity="guest",
+                               entity_id=guest["id"], event_id=event_id,
+                               detail=(f"{door['title']} · {guest['list_name']} · "
+                                       f"{guest['name']} · оффлайн"))
+                    else:
+                        status = "already"
+                else:
+                    if guest["status"] == "checked_in":
+                        conn.execute(
+                            "UPDATE guests SET status = 'invited', "
+                            "checked_in_at = NULL, checked_in_by = NULL, "
+                            "updated_at = ? WHERE id = ? AND event_id = ?",
+                            (now, guest["id"], event_id),
+                        )
+                        _audit(conn, {"user_id": None, "username": "door-offline"},
+                               "guest.return", entity="guest",
+                               entity_id=guest["id"], event_id=event_id,
+                               detail=(f"{door['title']} · {guest['list_name']} · "
+                                       f"{guest['name']} · оффлайн"))
+                    else:
+                        status = "already"
+                conn.execute(
+                    "INSERT INTO door_sync_operations (operation_id, event_id, "
+                    "guest_id, action, client_at, applied_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (op_id, event_id, guest["id"], action,
+                     str(raw.get("at") or "")[:40], now),
+                )
+                current = _door_guest_row(conn, event_id, guest["id"])
+                item = _door_guest_json(current)
+                updated[current["id"]] = item
+                results.append({"id": op_id, "status": status, "guest": item})
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return json_response({
+            "results": results,
+            "updated": list(updated.values()),
+            "stats": _door_event_stats(conn, event_id),
+            "serverNow": timeutil.iso_now(),
         })
     finally:
         conn.close()
@@ -2551,6 +2721,40 @@ def _door_guest_json(row) -> dict:
         "notes": row["notes"],
         "status": row["status"],
         "checkedInAt": row["checked_in_at"],
+    }
+
+
+def _door_phone_hash(key: str, phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    if not digits:
+        return ""
+    return hashlib.sha256(f"{key}:{digits}".encode("utf-8")).hexdigest()
+
+
+def _door_snapshot_guest_json(row, key: str) -> dict:
+    item = _door_guest_json(row)
+    item["phoneHash"] = _door_phone_hash(key, row["phone"])
+    item["shareToken"] = row["share_token"]
+    return item
+
+
+def _door_snapshot_json(conn, door_row) -> dict:
+    guests = conn.execute(
+        "SELECT g.*, gl.name AS list_name, gl.is_blacklist FROM guests g "
+        "JOIN guest_lists gl ON gl.id = g.list_id "
+        "WHERE g.event_id = ? ORDER BY g.name COLLATE NOCASE, g.id",
+        (door_row["link_event_id"],),
+    ).fetchall()
+    now = timeutil.iso_now()
+    return {
+        "event": _door_event_json(conn, door_row)["event"],
+        "stats": _door_event_stats(conn, door_row["link_event_id"]),
+        "guests": [
+            _door_snapshot_guest_json(guest, door_row["link_token"])
+            for guest in guests
+        ],
+        "generatedAt": now,
+        "serverNow": now,
     }
 
 

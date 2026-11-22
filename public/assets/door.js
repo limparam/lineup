@@ -4,6 +4,13 @@ import {
   formatRangeShort,
   loadSiteChrome,
 } from "./common.js?v=20";
+import {
+  enqueueOperation,
+  loadSnapshot,
+  pendingOperations,
+  removeOperations,
+  saveSnapshot,
+} from "./door-offline.js?v=1";
 
 const token = decodeURIComponent(
   location.pathname.replace(/^\/door\//, "").replace(/\/+$/, ""),
@@ -11,6 +18,14 @@ const token = decodeURIComponent(
 const host = document.getElementById("door");
 let eventData = null;
 let stats = null;
+let guests = [];
+let snapshotLoaded = false;
+let offline = false;
+let offlineReady = false;
+let pendingCount = 0;
+let syncBusy = false;
+let lastSyncAt = null;
+let refreshTimer = null;
 let cameraStream = null;
 let cameraTimer = null;
 let scanDetector = null;
@@ -31,16 +46,24 @@ function toast(message, kind = "ok") {
 }
 
 async function call(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    cache: "no-store",
-    credentials: "same-origin",
-    headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
-      ...(options.headers || {}),
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: {
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(options.headers || {}),
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+  } catch (cause) {
+    const error = new Error("Нет связи с сервером.");
+    error.network = true;
+    error.cause = cause;
+    throw error;
+  }
   let data = null;
   try {
     data = await response.json();
@@ -48,8 +71,12 @@ async function call(path, options = {}) {
     /* not json */
   }
   if (!response.ok) {
-    throw new Error((data && data.error && data.error.message)
+    const error = new Error((data && data.error && data.error.message)
       || "Не удалось выполнить запрос.");
+    error.status = response.status;
+    // Прокси и шлюзы отвечают 502/503/504, когда связи с сервером нет.
+    if (response.status >= 500) error.network = true;
+    throw error;
   }
   return data;
 }
@@ -71,6 +98,292 @@ function updateStats(next) {
   ]) {
     const node = document.getElementById(id);
     if (node) node.textContent = String(value || 0);
+  }
+}
+
+function applySnapshot(snapshot, isOffline) {
+  eventData = { event: snapshot.event, stats: snapshot.stats };
+  stats = { ...snapshot.stats };
+  guests = (snapshot.guests || []).map((guest) => ({ ...guest }));
+  snapshotLoaded = true;
+  offline = Boolean(isOffline);
+  lastSyncAt = snapshot.generatedAt || snapshot.savedAt || null;
+}
+
+async function persistLocal() {
+  if (!eventData) return;
+  try {
+    await saveSnapshot(token, {
+      event: eventData.event,
+      stats,
+      guests,
+      generatedAt: lastSyncAt,
+      serverNow: new Date().toISOString(),
+    });
+  } catch {
+    /* локальное сохранение не должно ломать экран */
+  }
+}
+
+function normalizeName(value) {
+  return String(value || "").toLocaleLowerCase("ru");
+}
+
+function findBlacklistMatch(guest) {
+  if (guest.blacklisted) return guest;
+  const name = normalizeName(guest.name);
+  for (const item of guests) {
+    if (!item.blacklisted) continue;
+    if (guest.phoneHash && item.phoneHash
+        && guest.phoneHash === item.phoneHash) {
+      return item;
+    }
+    if (name.length >= 3 && normalizeName(item.name) === name) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function decorateGuest(guest) {
+  const match = findBlacklistMatch(guest);
+  return {
+    ...guest,
+    blacklistMatch: match && match.id !== guest.id ? match : null,
+  };
+}
+
+function searchLocal(query) {
+  const nameQuery = normalizeName(query);
+  const digits = String(query || "").replace(/\D/g, "");
+  const rows = guests.filter((guest) => {
+    const nameHit = normalizeName(guest.name).includes(nameQuery);
+    const phoneHit = digits
+      && String(guest.phoneMasked || "").replace(/\D/g, "").includes(digits);
+    return nameHit || phoneHit;
+  });
+  rows.sort((a, b) => {
+    const byStatus = (a.status === "checked_in" ? 1 : 0)
+      - (b.status === "checked_in" ? 1 : 0);
+    return byStatus
+      || normalizeName(a.name).localeCompare(normalizeName(b.name), "ru");
+  });
+  return rows.slice(0, 30).map(decorateGuest);
+}
+
+function guestByCode(code) {
+  const match = String(code || "").match(/\/g\/([A-Za-z0-9_-]{16,80})/);
+  const guestToken = match ? match[1] : String(code || "").trim();
+  return guests.find((guest) => guest.shareToken === guestToken) || null;
+}
+
+function newOperationId() {
+  if (window.crypto && window.crypto.randomUUID) {
+    return window.crypto.randomUUID();
+  }
+  return `op-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function formatClock(iso) {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleTimeString("ru-RU", {
+      hour: "2-digit", minute: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+function renderOfflineStatus() {
+  const node = document.getElementById("door-offline-status");
+  if (!node) return;
+  node.className = "door-offline-status";
+  if (offline) {
+    node.hidden = false;
+    node.classList.add("is-offline");
+    node.textContent = pendingCount > 0
+      ? `Оффлайн-режим. Не отправлено: ${pendingCount}. `
+        + "Не закрывайте вкладку до конца смены."
+      : "Оффлайн-режим. Список сохранён на устройстве — можно отмечать гостей.";
+  } else if (pendingCount > 0) {
+    node.hidden = false;
+    node.classList.add("is-pending");
+    node.textContent = `Ожидают отправки: ${pendingCount}. `
+      + "Отправим автоматически, когда появится связь.";
+  } else if (lastSyncAt) {
+    node.hidden = false;
+    node.classList.add("is-online");
+    node.textContent = (offlineReady ? "Оффлайн-копия готова" : "Список загружен")
+      + (formatClock(lastSyncAt) ? ` · обновлён ${formatClock(lastSyncAt)}` : "");
+  } else {
+    node.hidden = true;
+  }
+}
+
+async function queueLocalAction(guest, action) {
+  const wasChecked = guest.status === "checked_in";
+  if (action === "checkin" && wasChecked) return guest;
+  if (action === "undo" && !wasChecked) return guest;
+  const at = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const current = guests.find((item) => item.id === guest.id) || guest;
+  current.status = action === "checkin" ? "checked_in" : "invited";
+  current.checkedInAt = action === "checkin" ? at : null;
+  if (action === "checkin") {
+    stats.checkedInCount = (stats.checkedInCount || 0) + 1;
+  } else {
+    stats.checkedInCount = Math.max(0, (stats.checkedInCount || 0) - 1);
+  }
+  eventData.stats = stats;
+  await persistLocal();
+  await enqueueOperation(token, {
+    id: newOperationId(),
+    guestId: current.id,
+    action,
+    at,
+  });
+  pendingCount += 1;
+  updateStats(stats);
+  renderOfflineStatus();
+  if (!offline) await flushOutbox();
+  return guests.find((item) => item.id === guest.id) || current;
+}
+
+async function flushOutbox() {
+  if (syncBusy || offline) {
+    renderOfflineStatus();
+    return;
+  }
+  let pending = [];
+  try {
+    pending = await pendingOperations(token);
+  } catch {
+    return;
+  }
+  pendingCount = pending.length;
+  if (!pending.length) {
+    renderOfflineStatus();
+    return;
+  }
+  syncBusy = true;
+  try {
+    const data = await call(
+      `/api/door/${encodeURIComponent(token)}/sync`,
+      {
+        method: "POST",
+        body: {
+          operations: pending.map(({ id, guestId, action, at }) => ({
+            id, guestId, action, at,
+          })),
+        },
+      },
+    );
+    await removeOperations(pending.map((item) => item.id));
+    for (const item of data.updated || []) {
+      const index = guests.findIndex((guest) => guest.id === item.id);
+      if (index >= 0) {
+        const old = guests[index];
+        guests[index] = {
+          ...old,
+          ...item,
+          shareToken: old.shareToken,
+          phoneHash: old.phoneHash,
+        };
+      }
+    }
+    if (data.stats) {
+      stats = { ...data.stats };
+      eventData.stats = stats;
+      updateStats(stats);
+    }
+    lastSyncAt = data.serverNow || new Date().toISOString();
+    offline = false;
+    try {
+      pendingCount = (await pendingOperations(token)).length;
+    } catch {
+      pendingCount = 0;
+    }
+    await persistLocal();
+    const conflicts = (data.results || []).filter(
+      (item) => item.status === "conflict");
+    if (conflicts.length) {
+      toast(conflicts[0].message || "Конфликт синхронизации", "error");
+    }
+    const input = document.getElementById("door-search");
+    if (input && input.value.trim()) await searchGuests();
+  } catch (error) {
+    if (error.network) {
+      offline = true;
+    } else {
+      toast(error.message, "error");
+    }
+  } finally {
+    syncBusy = false;
+    renderOfflineStatus();
+  }
+}
+
+async function refreshSnapshot({ silent = false } = {}) {
+  try {
+    const snapshot = await call(
+      `/api/door/${encodeURIComponent(token)}/snapshot`);
+    await saveSnapshot(token, snapshot);
+    applySnapshot(snapshot, false);
+    try {
+      pendingCount = (await pendingOperations(token)).length;
+    } catch {
+      pendingCount = 0;
+    }
+    if (silent) {
+      updateStats(stats);
+      renderOfflineStatus();
+      const input = document.getElementById("door-search");
+      if (input && input.value.trim()) await searchGuests();
+    } else {
+      render();
+      renderOfflineStatus();
+    }
+    return true;
+  } catch (error) {
+    if (error.network) {
+      offline = true;
+      renderOfflineStatus();
+    }
+    return false;
+  }
+}
+
+async function toggleGuest(guest, { featured = false } = {}) {
+  const decorated = decorateGuest(guest);
+  if (decorated.blacklisted || decorated.blacklistMatch) {
+    showGuest(decorated);
+    toast("Гость в чёрном списке — вход запрещён", "error");
+    return;
+  }
+  const action = guest.status === "checked_in" ? "undo" : "checkin";
+  const updated = await queueLocalAction(guest, action);
+  const view = decorateGuest(updated);
+  if (featured) showGuest(view);
+  else await searchGuests();
+  const queued = offline || pendingCount > 0;
+  if (action === "checkin") {
+    toast(queued ? "Отмечено и сохранено на устройстве" : "Гость отмечен");
+  } else {
+    toast(queued ? "Отметка снята и сохранена" : "Отметка снята");
+  }
+}
+
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+  try {
+    await navigator.serviceWorker.register("/door-sw.js", { scope: "/door/" });
+    await navigator.serviceWorker.ready;
+    const cache = await caches.open("lineup-door-v9");
+    await cache.add(location.href).catch(() => {});
+    offlineReady = Boolean(await cache.match(location.href));
+    renderOfflineStatus();
+  } catch {
+    /* оффлайн-кэш не критичен для текущей сессии */
   }
 }
 
@@ -100,16 +413,7 @@ function guestCard(guest, { featured = false } = {}) {
         onClick: async () => {
           setBusy(action, true);
           try {
-            const data = await call(
-              `/api/door/${encodeURIComponent(token)}/${checked ? "undo" : "checkin"}`,
-              { method: "POST", body: { guestId: guest.id } },
-            );
-            updateStats(data.stats);
-            if (featured) showGuest(data.guest);
-            else await searchGuests();
-            toast(data.guest.status === "checked_in"
-              ? "Гость отмечен"
-              : "Отметка снята");
+            await toggleGuest(guest, { featured });
           } catch (error) {
             toast(error.message, "error");
           } finally {
@@ -172,47 +476,89 @@ async function searchGuests() {
     clear(resultHost);
     return;
   }
-  try {
-    const data = await call(
-      `/api/door/${encodeURIComponent(token)}/search?q=${encodeURIComponent(query)}`,
-    );
-    updateStats(data.stats);
-    clear(resultHost);
-    if (!data.guests.length) {
-      resultHost.append(el("div", { class: "door__empty", text: "Никого не нашли" }));
-      return;
-    }
-    resultHost.append(...data.guests.map((guest) => guestCard(guest)));
-  } catch (error) {
-    toast(error.message, "error");
+  const results = searchLocal(query);
+  clear(resultHost);
+  if (!results.length) {
+    resultHost.append(el("div", {
+      class: "door__empty",
+      text: snapshotLoaded
+        ? "Никого не нашли в сохранённом списке"
+        : "Список гостей ещё не загружен",
+    }));
+    return;
   }
+  resultHost.append(...results.map((guest) => guestCard(guest)));
 }
 
 async function submitScan(code) {
-  if (!code || !code.trim()) return;
-  try {
-    const data = await call(`/api/door/${encodeURIComponent(token)}/scan`, {
-      method: "POST",
-      body: { code: code.trim() },
-    });
-    updateStats(data.stats);
-    data.guest.blacklistMatch = data.blacklistMatch
-      && data.blacklistMatch.id !== data.guest.id
-      ? data.blacklistMatch
-      : null;
-    showGuest(data.guest);
-    const scanInput = document.getElementById("door-scan-input");
-    if (scanInput) scanInput.value = "";
-    if (data.blacklisted) {
-      toast("Гость в чёрном списке — вход запрещён", "error");
-    } else if (data.already) {
-      toast("Этот гость уже отмечен");
-    } else {
-      toast("Гость отмечен");
+  const raw = String(code || "").trim();
+  if (!raw) return;
+  const scanInput = document.getElementById("door-scan-input");
+  const guest = guestByCode(raw);
+  if (!guest) {
+    if (!offline) {
+      try {
+        const data = await call(
+          `/api/door/${encodeURIComponent(token)}/scan`,
+          { method: "POST", body: { code: raw } },
+        );
+        data.guest.blacklistMatch = data.blacklistMatch
+          && data.blacklistMatch.id !== data.guest.id
+          ? data.blacklistMatch
+          : null;
+        const index = guests.findIndex((item) => item.id === data.guest.id);
+        if (index >= 0) {
+          const old = guests[index];
+          guests[index] = {
+            ...old,
+            ...data.guest,
+            shareToken: old.shareToken,
+            phoneHash: old.phoneHash,
+          };
+        } else {
+          guests.push(data.guest);
+        }
+        if (data.stats) {
+          stats = { ...data.stats };
+          eventData.stats = stats;
+          updateStats(stats);
+        }
+        lastSyncAt = new Date().toISOString();
+        await persistLocal();
+        renderOfflineStatus();
+        showGuest(data.guest);
+        if (scanInput) scanInput.value = "";
+        if (data.blacklisted) {
+          toast("Гость в чёрном списке — вход запрещён", "error");
+        } else if (data.already) {
+          toast("Этот гость уже отмечен");
+        } else {
+          toast("Гость отмечен");
+        }
+        return;
+      } catch (error) {
+        toast(error.message, "error");
+        return;
+      }
     }
-  } catch (error) {
-    toast(error.message, "error");
+    toast("Гостя нет в сохранённом списке", "error");
+    return;
   }
+  const view = decorateGuest(guest);
+  if (view.blacklisted || view.blacklistMatch) {
+    showGuest(view);
+    if (scanInput) scanInput.value = "";
+    toast("Гость в чёрном списке — вход запрещён", "error");
+    return;
+  }
+  if (guest.status === "checked_in") {
+    showGuest(view);
+    if (scanInput) scanInput.value = "";
+    toast("Этот гость уже отмечен");
+    return;
+  }
+  await toggleGuest(guest, { featured: true });
+  if (scanInput) scanInput.value = "";
 }
 
 async function stopCamera() {
@@ -500,6 +846,11 @@ function render() {
           el("span", { text: "Пришло на мероприятие" }),
         ]),
       ]),
+      el("div", {
+        id: "door-offline-status",
+        class: "door-offline-status",
+        hidden: true,
+      }),
       el("div", { class: "panel door__panel" }, [
         scanForm,
         el("p", {
@@ -531,26 +882,120 @@ function render() {
         searchForm,
         el("div", { id: "door-results", class: "door-results" }),
       ]),
+      el("details", { class: "door-help" }, [
+        el("summary", { text: "Оффлайн-режим: как это работает" }),
+        el("p", {
+          text: "Откройте эту страницу при интернете — список гостей "
+            + "сохранится на устройстве. Если связь пропадёт, поиск, QR-коды "
+            + "и отметки входа продолжат работать.",
+        }),
+        el("p", {
+          text: "Отметки сохраняются локально и отправятся автоматически, "
+            + "когда интернет вернётся. Не закрывайте вкладку до конца смены "
+            + "и не очищайте данные сайта.",
+        }),
+        el("p", {
+          text: "Если вкладка всё-таки закрылась, откройте ссылку снова "
+            + "при появлении связи — сохранённые данные останутся.",
+        }),
+        el("p", {
+          text: "Оффлайн-копия работает по HTTPS или на localhost. "
+            + "На обычном HTTP страница без интернета не откроется.",
+        }),
+        el("p", {
+          text: "Если гостя нет в сохранённой копии, вход не подтверждается. "
+            + "Обновите список, когда появится связь.",
+        }),
+      ]),
     ]),
   );
   if (window.matchMedia("(pointer: fine)").matches) {
     document.getElementById("door-scan-input")?.focus({ preventScroll: true });
   }
+  renderOfflineStatus();
 }
 
 async function load() {
+  registerServiceWorker();
+  let cached = null;
   try {
-    const data = await call(`/api/door/${encodeURIComponent(token)}`);
-    eventData = data;
-    stats = data.stats;
+    cached = await loadSnapshot(token);
+  } catch {
+    cached = null;
+  }
+  try {
+    pendingCount = (await pendingOperations(token)).length;
+  } catch {
+    pendingCount = 0;
+  }
+  if (cached) {
+    applySnapshot(cached, true);
+    render();
+  }
+  try {
+    if (pendingCount > 0) await flushOutbox();
+    const snapshot = await call(
+      `/api/door/${encodeURIComponent(token)}/snapshot`);
+    await saveSnapshot(token, snapshot);
+    applySnapshot(snapshot, false);
+    try {
+      pendingCount = (await pendingOperations(token)).length;
+    } catch {
+      pendingCount = 0;
+    }
     render();
   } catch (error) {
-    clear(host).append(errorState(
-      "Ссылка недействительна",
-      error.message || "Попросите организатора создать новую ссылку.",
-    ));
+    if (cached && error.network) {
+      offline = true;
+      render();
+    } else if (cached) {
+      clear(host).append(errorState(
+        "Ссылка недействительна",
+        error.message || "Попросите организатора создать новую ссылку.",
+      ));
+    } else {
+      const noCache = error.network;
+      clear(host).append(errorState(
+        noCache ? "Нет сохранённого списка" : "Ссылка недействительна",
+        noCache
+          ? "Откройте ссылку при интернете, чтобы сохранить список гостей."
+          : (error.message || "Попросите организатора создать новую ссылку."),
+      ));
+    }
   }
+  renderOfflineStatus();
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(async () => {
+    if (syncBusy) return;
+    if (offline) {
+      if (!navigator.onLine) return;
+      const restored = await refreshSnapshot({ silent: true });
+      if (restored && pendingCount > 0) await flushOutbox();
+      return;
+    }
+    await flushOutbox();
+  }, 20000);
 }
 
 load();
 window.addEventListener("pagehide", stopCamera);
+window.addEventListener("beforeunload", (event) => {
+  if (pendingCount > 0) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+window.addEventListener("offline", () => {
+  offline = true;
+  renderOfflineStatus();
+});
+window.addEventListener("online", async () => {
+  offline = false;
+  await flushOutbox();
+  await refreshSnapshot();
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && !offline && !syncBusy) {
+    flushOutbox();
+  }
+});

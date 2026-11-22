@@ -1588,6 +1588,89 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("camera=(self)", headers["permissions-policy"])
 
+    def test_door_offline_snapshot_and_sync(self):
+        event = self.create_event(title="OFFLINE DOOR")
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        blacklist = next(item for item in data["lists"] if item["isBlacklist"])
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Гости"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        list_id = data["list"]["id"]
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/door-link", {},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        door_token = data["link"]["path"].rsplit("/", 1)[-1]
+
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{list_id}/guests",
+            {"name": "Sync Guest", "phone": "+7 999 111-22-33"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        guest = data["guest"]
+        status, _, data = self.client.post(
+            f"/api/admin/guest-lists/{blacklist['id']}/guests",
+            {"name": "Blocked Sync", "phone": "+7 999 111-22-34"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        blocked = data["guest"]
+
+        status, _, snap = self.client.get(f"/api/door/{door_token}/snapshot")
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["event"]["title"], "OFFLINE DOOR")
+        self.assertEqual(snap["stats"]["guestCount"], 1)
+        by_name = {item["name"]: item for item in snap["guests"]}
+        self.assertEqual(by_name["Sync Guest"]["status"], "invited")
+        self.assertTrue(by_name["Sync Guest"]["phoneHash"])
+        self.assertTrue(by_name["Sync Guest"]["shareToken"])
+        self.assertTrue(by_name["Blocked Sync"]["blacklisted"])
+        self.assertTrue(by_name["Blocked Sync"]["phoneHash"])
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/sync",
+            {"operations": [
+                {"id": "offline-op-1", "guestId": guest["id"],
+                 "action": "checkin", "at": "2027-11-04T22:15:00.482Z"},
+            ]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["results"][0]["status"], "applied")
+        self.assertEqual(data["updated"][0]["status"], "checked_in")
+        self.assertEqual(data["updated"][0]["checkedInAt"], "2027-11-04T22:15:00Z")
+        self.assertEqual(data["stats"]["checkedInCount"], 1)
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/sync",
+            {"operations": [
+                {"id": "offline-op-1", "guestId": guest["id"],
+                 "action": "checkin", "at": "2027-11-04T22:15:00Z"},
+            ]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["results"][0]["status"], "duplicate")
+        self.assertEqual(data["stats"]["checkedInCount"], 1)
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/sync",
+            {"operations": [
+                {"id": "offline-op-2", "guestId": blocked["id"],
+                 "action": "checkin"},
+            ]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["results"][0]["status"], "conflict")
+        self.assertIn("чёрном списке", data["results"][0]["message"])
+
+        status, _, data = self.client.post(
+            f"/api/door/{door_token}/sync",
+            {"operations": [
+                {"id": "offline-op-3", "guestId": guest["id"],
+                 "action": "undo"},
+            ]}, csrf=None)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["results"][0]["status"], "applied")
+        self.assertEqual(data["updated"][0]["status"], "invited")
+        self.assertEqual(data["stats"]["checkedInCount"], 0)
+
     def test_guest_list_validation_and_public_visibility(self):
         event = self.create_event(title="GUEST VALIDATION")
         status, _, data = self.client.post(
