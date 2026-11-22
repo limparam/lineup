@@ -463,12 +463,15 @@ function currentGuestList() {
   return guestLists.find((item) => item.id === activeGuestListId) || null;
 }
 
-function guestInvitesAvailable() {
+function eventGuestEditable() {
   return Boolean(
     guestEvent
-    && guestEvent.published
     && new Date(guestEvent.endsAt).getTime() > Date.now(),
   );
+}
+
+function guestInvitesAvailable() {
+  return Boolean(eventGuestEditable() && guestEvent.published);
 }
 
 function setGuestList(list) {
@@ -1019,15 +1022,18 @@ function renderGuestHeader() {
     || activeList.isBlacklist;
   renderGuestPromoters();
   const available = guestInvitesAvailable();
-  $("guest-add-form").hidden = !available;
+  const editable = eventGuestEditable();
+  $("guest-add-form").hidden = !editable;
   $("guest-add-title").textContent = activeList && activeList.isBlacklist
     ? "Добавить в чёрный список"
     : "Добавить гостя";
-  $("guest-list-role").textContent = !available
-    ? "Мероприятие завершено — приглашения недоступны"
+  $("guest-list-role").textContent = !editable
+    ? "Мероприятие завершено — изменения недоступны"
     : activeList && activeList.isBlacklist
       ? "Гости отсюда не получают приглашения"
-      : (guestRole === "promoter" ? "Режим промоутера" : "");
+      : !guestEvent.published
+        ? "Черновик — приглашения появятся после публикации"
+        : (guestRole === "promoter" ? "Режим промоутера" : "");
 }
 
 function renderGuestCards() {
@@ -1093,6 +1099,8 @@ function renderGuestCards() {
             title: "Открыть приглашение с QR-кодом",
             onClick: () => openGuestPass(guest),
           }),
+        ] : []),
+        ...(eventGuestEditable() && !blacklisted ? [
           el("button", {
             class: "btn btn--sm" + (checked ? "" : " btn--ghost"),
             type: "button",
