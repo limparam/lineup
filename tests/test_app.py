@@ -1254,8 +1254,10 @@ class LineUPTestCase(unittest.TestCase):
         conn = db.connect()
         try:
             conn.execute(
-                "UPDATE guest_registration_links SET expires_at = '2020-01-01T00:00:00Z' "
-                "WHERE id = ?", (expired["id"],))
+                "UPDATE guest_registration_links SET expiry_mode = 'custom', "
+                "expiry_offset_minutes = NULL, "
+                "expires_at = '2020-01-01T00:00:00Z' WHERE id = ?",
+                (expired["id"],))
             conn.commit()
         finally:
             conn.close()
@@ -1311,6 +1313,82 @@ class LineUPTestCase(unittest.TestCase):
             {"listId": guest_list["id"], "expiryMode": "never"},
             csrf=promo_client.csrf)
         self.assertEqual(status, 403, data)
+
+    def test_registration_link_expiry_follows_event_shift(self):
+        event = self.create_event(
+            title="SHIFT REGISTRATION",
+            startsAt="2027-03-10T20:00",
+            endsAt="2027-03-11T06:00",
+        )
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guest-lists",
+            {"name": "Гости"}, csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        list_id = data["list"]["id"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": list_id, "comment": "shift+1",
+             "expiryMode": "start+1"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        relative = data["link"]
+        self.assertEqual(relative["expiryMode"], "start")
+        self.assertEqual(relative["expiryOffsetMinutes"], 60)
+        old_expiry = relative["expiresAt"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": list_id, "comment": "custom",
+             "expiryMode": "custom",
+             "expiresAtLocal": "2027-03-10T22:00"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        custom = data["link"]
+        self.assertEqual(custom["expiryMode"], "custom")
+        custom_expiry = custom["expiresAt"]
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/registration-links",
+            {"listId": list_id, "comment": "never",
+             "expiryMode": "never"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        never = data["link"]
+        self.assertEqual(never["expiryMode"], "never")
+        self.assertIsNone(never["expiresAt"])
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/shift",
+            {"startsAt": "2027-03-10T23:00"}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+
+        status, _, data = self.client.get(
+            f"/api/public/registration/{relative['token']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["event"]["startsAt"], "2027-03-10T20:00:00Z")
+        self.assertEqual(data["expiresAt"], "2027-03-10T21:00:00Z")
+        self.assertNotEqual(data["expiresAt"], old_expiry)
+
+        status, _, data = self.client.get(
+            f"/api/public/registration/{custom['token']}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["expiresAt"], custom_expiry)
+        self.assertEqual(data["expiresAt"], "2027-03-10T19:00:00Z")
+
+        status, _, data = self.client.get(
+            f"/api/public/registration/{never['token']}")
+        self.assertEqual(status, 200, data)
+        self.assertIsNone(data["expiresAt"])
+
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/registration-links")
+        self.assertEqual(status, 200, data)
+        saved = {item["comment"]: item for item in data["links"]}
+        self.assertEqual(saved["shift+1"]["expiresAt"],
+                         "2027-03-10T21:00:00Z")
+        self.assertEqual(saved["custom"]["expiresAt"],
+                         "2027-03-10T19:00:00Z")
 
     def test_multiple_promoters_on_lists(self):
         event = self.create_event(title="PROMOTER NIGHT")

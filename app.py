@@ -1131,7 +1131,7 @@ def api_public_registration_info(req, token):
             "registrationCount": state["registrationCount"],
             "maxRegistrations": state["maxRegistrations"],
             "remaining": state["remaining"],
-            "expiresAt": row["expires_at"],
+            "expiresAt": state["expiresAt"],
             "serverNow": timeutil.iso_now(),
         })
     finally:
@@ -2318,7 +2318,16 @@ def _registration_link_state(conn, row) -> dict:
     now = timeutil.iso_now()
     limit = int(row["max_registrations"]) if row["max_registrations"] else None
     limit_reached = limit is not None and count >= limit
-    expired = bool(row["expires_at"] and row["expires_at"] < now)
+    mode = row["expiry_mode"] if "expiry_mode" in row.keys() else "custom"
+    offset = (row["expiry_offset_minutes"]
+              if "expiry_offset_minutes" in row.keys() else None)
+    effective_expires = row["expires_at"]
+    if mode == "never":
+        effective_expires = None
+    elif mode == "start" and offset is not None:
+        effective_expires = timeutil.to_iso(
+            timeutil.parse_iso(row["event_starts"]) + timedelta(minutes=offset))
+    expired = bool(effective_expires and effective_expires < now)
     event_ended = row["event_ends"] < now
     active = bool(row["is_active"])
     reason = ""
@@ -2334,6 +2343,9 @@ def _registration_link_state(conn, row) -> dict:
         "registrationCount": count,
         "maxRegistrations": limit,
         "remaining": None if limit is None else max(0, limit - count),
+        "expiresAt": effective_expires,
+        "expiryMode": mode,
+        "expiryOffsetMinutes": offset,
         "expired": expired,
         "limitReached": limit_reached,
         "eventEnded": event_ended,
@@ -2353,18 +2365,19 @@ def _registration_link_json(conn, row) -> dict:
         "token": row["token"],
         "path": f"/r/{row['token']}",
         "comment": row["comment"],
-        "expiresAt": row["expires_at"],
         "createdAt": row["created_at"],
         **state,
     }
 
 
-def _registration_expiry(data: dict, event) -> str | None:
+def _registration_expiry(data: dict, event) -> dict:
     mode = str(data.get("expiryMode") or "never").strip()
     if mode == "never":
-        return None
+        return {"mode": "never", "offset": None, "expires": None}
     starts = timeutil.parse_iso(event["starts_at"])
+    offset = None
     if mode == "start":
+        offset = 0
         expires = starts
     elif mode.startswith("start+"):
         try:
@@ -2375,6 +2388,7 @@ def _registration_expiry(data: dict, event) -> str | None:
         if hours < 1 or hours > 336:
             raise APIError(400, "validation",
                            "Срок после начала — от 1 до 336 часов.")
+        offset = hours * 60
         expires = starts + timedelta(hours=hours)
     elif mode == "custom":
         raw = data.get("expiresAtLocal")
@@ -2392,7 +2406,9 @@ def _registration_expiry(data: dict, event) -> str | None:
     if iso < timeutil.iso_now():
         raise APIError(400, "validation",
                        "Время окончания регистрации уже прошло.")
-    return iso
+    if offset is None:
+        return {"mode": "custom", "offset": None, "expires": iso}
+    return {"mode": "start", "offset": offset, "expires": iso}
 
 
 def _registration_limit(raw) -> int | None:
@@ -3090,14 +3106,16 @@ def api_admin_registration_link_create(req, event_id):
             raise APIError(400, "validation",
                            "Комментарий — до 500 символов.")
         limit = _registration_limit(data.get("maxRegistrations"))
-        expires_at = _registration_expiry(data, event)
+        expiry = _registration_expiry(data, event)
         token = _new_registration_token(conn)
         now = timeutil.iso_now()
         cur = conn.execute(
             "INSERT INTO guest_registration_links (event_id, list_id, token, "
-            "comment, max_registrations, expires_at, is_active, created_by, "
-            "created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
-            (event["id"], target["id"], token, comment, limit, expires_at,
+            "comment, max_registrations, expires_at, expiry_mode, "
+            "expiry_offset_minutes, is_active, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (event["id"], target["id"], token, comment, limit,
+             expiry["expires"], expiry["mode"], expiry["offset"],
              session["user_id"], now),
         )
         _audit(conn, session, "registration.link.create",

@@ -789,6 +789,11 @@ function renderRegistrationLinks() {
     const expiry = link.expiresAt
       ? `до ${formatRegistrationDate(link.expiresAt)}`
       : "бессрочно";
+    const expiryNote = link.expiryMode === "start"
+      ? " · сдвигается с мероприятием"
+      : link.expiryMode === "custom"
+        ? " · фиксированная дата"
+        : "";
     const actions = [
       el("button", {
         class: "btn btn--sm",
@@ -847,7 +852,7 @@ function renderRegistrationLinks() {
       el("div", {
         class: "registration-link__meta",
         text: `Список: ${link.listName} · Регистраций: `
-          + `${link.registrationCount} ${limit} · ${expiry}`,
+          + `${link.registrationCount} ${limit} · ${expiry}${expiryNote}`,
       }),
       el("code", { class: "registration-link__url", text: registrationLinkUrl(link) }),
       el("div", { class: "registration-link__actions" }, actions),

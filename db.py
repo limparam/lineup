@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -126,6 +126,8 @@ CREATE TABLE IF NOT EXISTS guest_registration_links (
     comment           TEXT NOT NULL DEFAULT '',
     max_registrations INTEGER,
     expires_at        TEXT,
+    expiry_mode       TEXT NOT NULL DEFAULT 'custom',
+    expiry_offset_minutes INTEGER,
     is_active         INTEGER NOT NULL DEFAULT 1,
     created_by        INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at        TEXT NOT NULL
@@ -346,6 +348,56 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE guests ADD COLUMN registration_link_id INTEGER"
         )
+
+    # Срок ссылки саморегистрации: относительный или абсолютный.
+    link_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(guest_registration_links)")
+    }
+    if "expiry_mode" not in link_columns:
+        conn.execute(
+            "ALTER TABLE guest_registration_links ADD COLUMN "
+            "expiry_mode TEXT NOT NULL DEFAULT 'custom'"
+        )
+    if "expiry_offset_minutes" not in link_columns:
+        conn.execute(
+            "ALTER TABLE guest_registration_links ADD COLUMN "
+            "expiry_offset_minutes INTEGER"
+        )
+    try:
+        links = conn.execute(
+            "SELECT rl.id, rl.expires_at, e.starts_at "
+            "FROM guest_registration_links rl "
+            "JOIN events e ON e.id = rl.event_id"
+        ).fetchall()
+        for link in links:
+            if not link["expires_at"]:
+                conn.execute(
+                    "UPDATE guest_registration_links SET expiry_mode = 'never', "
+                    "expiry_offset_minutes = NULL WHERE id = ?",
+                    (link["id"],),
+                )
+                continue
+            try:
+                expires = datetime.strptime(
+                    link["expires_at"], "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+                starts = datetime.strptime(
+                    link["starts_at"], "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            delta = expires - starts
+            minutes = int(delta.total_seconds() // 60)
+            if (delta == timedelta(minutes=minutes)
+                    and minutes in (0, 60, 120, 180)):
+                conn.execute(
+                    "UPDATE guest_registration_links SET expiry_mode = 'start', "
+                    "expiry_offset_minutes = ? WHERE id = ?",
+                    (minutes, link["id"]),
+                )
+    except sqlite3.OperationalError:
+        pass
 
     # Владелец мероприятия и видимость лайнапа.
     event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
