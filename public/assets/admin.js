@@ -471,7 +471,7 @@ function eventGuestEditable() {
 }
 
 function guestInvitesAvailable() {
-  return Boolean(eventGuestEditable() && guestEvent.published);
+  return eventGuestEditable();
 }
 
 function setGuestList(list) {
@@ -1032,7 +1032,7 @@ function renderGuestHeader() {
     : activeList && activeList.isBlacklist
       ? "Гости отсюда не получают приглашения"
       : !guestEvent.published
-        ? "Черновик — приглашения появятся после публикации"
+        ? "Черновик — событие не показывается в афише, но прямые ссылки работают"
         : (guestRole === "promoter" ? "Режим промоутера" : "");
 }
 

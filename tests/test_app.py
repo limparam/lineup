@@ -1536,19 +1536,43 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(status, 201, data)
         guest = data["guest"]
 
-        # Черновик не отдаёт приглашение публично.
+        # У черновика событие скрыто из афиши, но прямые ссылки работают.
         draft = self.create_event(title="DRAFT GUEST", published=False)
         status, _, data = self.client.post(
             f"/api/admin/events/{draft['id']}/guest-lists",
             {"name": "Гости"}, csrf=self.client.csrf)
         self.assertEqual(status, 201, data)
+        draft_list = data["list"]
         status, _, data = self.client.post(
-            f"/api/admin/guest-lists/{data['list']['id']}/guests",
+            f"/api/admin/guest-lists/{draft_list['id']}/guests",
             {"name": "Draft"}, csrf=self.client.csrf)
         self.assertEqual(status, 201, data)
+        draft_guest = data["guest"]
+        status, _, public = self.client.get(
+            f"/api/public/guests/{draft_guest['shareToken']}")
+        self.assertEqual(status, 200, public)
+        self.assertEqual(public["guest"]["name"], "Draft")
         status, _, _ = self.client.get(
+            f"/g/{draft_guest['shareToken']}/qr.png")
+        self.assertEqual(status, 200)
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{draft['id']}/registration-links",
+            {"listId": draft_list["id"], "expiryMode": "never"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 201, data)
+        draft_link = data["link"]
+        status, _, public = self.client.get(
+            f"/api/public/registration/{draft_link['token']}")
+        self.assertEqual(status, 200, public)
+        self.assertTrue(public["canRegister"])
+        status, _, data = self.client.post(
+            f"/api/public/registration/{draft_link['token']}",
+            {"name": "Draft Registered"}, csrf=None)
+        self.assertEqual(status, 201, data)
+        status, _, public = self.client.get(
             f"/api/public/guests/{data['guest']['shareToken']}")
-        self.assertEqual(status, 404)
+        self.assertEqual(status, 200, public)
 
         # Чужой администратор не видит список.
         self.create_admin("other", "other-password-1")

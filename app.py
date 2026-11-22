@@ -2305,7 +2305,7 @@ def _registration_link_by_token(conn, token: str):
         "WHERE rl.token = ?",
         (token,),
     ).fetchone()
-    if not row or int(row["is_blacklist"]) or not int(row["published"]):
+    if not row or int(row["is_blacklist"]):
         raise APIError(404, "not_found", "Ссылка на регистрацию не найдена.")
     return row
 
@@ -2320,12 +2320,9 @@ def _registration_link_state(conn, row) -> dict:
     limit_reached = limit is not None and count >= limit
     expired = bool(row["expires_at"] and row["expires_at"] < now)
     event_ended = row["event_ends"] < now
-    published = bool(row["published"])
     active = bool(row["is_active"])
     reason = ""
-    if not published:
-        reason = "unpublished"
-    elif event_ended:
+    if event_ended:
         reason = "event_ended"
     elif expired:
         reason = "expired"
@@ -2467,8 +2464,6 @@ def _public_guest_row(conn, token: str):
     if not row:
         raise APIError(404, "not_found", "Приглашение не найдено.")
     if int(row["is_blacklist"]):
-        raise APIError(404, "not_found", "Приглашение не найдено.")
-    if not int(row["published"]):
         raise APIError(404, "not_found", "Приглашение не найдено.")
     if row["event_ends"] < timeutil.iso_now():
         raise APIError(404, "not_found", "Мероприятие уже прошло.")
