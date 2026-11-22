@@ -183,10 +183,15 @@ gunicorn (3 воркера), SQLite, демо-база, локальная се�
 
 ### Публичный сайт
 
-| Афиша | Мероприятие | Артисты и диджеи |
-| --- | --- | --- |
-| [![Афиша LineUP](docs/screenshots/home.webp)](docs/screenshots/home.webp) | [![Страница мероприятия](docs/screenshots/event-live.webp)](docs/screenshots/event-live.webp) | [![Артисты и диджеи](docs/screenshots/artists.webp)](docs/screenshots/artists.webp) |
-| <sub>Событие в эфире, залы, прогресс сета и ближайшая афиша.</sub> | <sub>Текущий сет, оставшееся время и расписание по залам.</sub> | <sub>Поиск артиста, его мероприятия и залы.</sub> |
+| Афиша | Мероприятие |
+| --- | --- |
+| [![Афиша LineUP](docs/screenshots/home.webp)](docs/screenshots/home.webp) | [![Страница идущего мероприятия](docs/screenshots/event-live.webp)](docs/screenshots/event-live.webp) |
+| <sub>Событие в эфире, залы, прогресс сета и ближайшая афиша.</sub> | <sub>Текущий сет, оставшееся время и расписание по залам.</sub> |
+
+| Предстоящее событие | Артисты и диджеи |
+| --- | --- |
+| [![Страница предстоящего мероприятия](docs/screenshots/event-upcoming.webp)](docs/screenshots/event-upcoming.webp) | [![Артисты и диджеи](docs/screenshots/artists.webp)](docs/screenshots/artists.webp) |
+| <sub>Обратный отсчёт до начала и лайнап без подсветки.</sub> | <sub>Поиск артиста, его мероприятия и залы.</sub> |
 
 ### Телефон
 
