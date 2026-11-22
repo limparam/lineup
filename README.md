@@ -207,15 +207,26 @@ gunicorn (3 воркера), SQLite, демо-база, локальная се�
 
 ### Админка
 
-| Мероприятия | Редактор и расписание |
-| --- | --- |
-| [![Список мероприятий в админке](docs/screenshots/admin-events.webp)](docs/screenshots/admin-events.webp) | [![Редактор мероприятия](docs/screenshots/admin-event.webp)](docs/screenshots/admin-event.webp) |
-| <sub>Статусы «в эфире» и «скоро», залы, сеты и быстрые действия.</sub> | <sub>Данные, ссылки, публикация лайнапа и расписание по залам.</sub> |
+<p align="center">
+  <a href="docs/screenshots/admin-events.webp">
+    <img src="docs/screenshots/admin-events.webp"
+         alt="Список мероприятий в админке LineUP" width="100%">
+  </a><br>
+  <sub>Список мероприятий: статусы «в эфире» и «скоро», залы, сеты и быстрые действия.</sub>
+</p>
 
-| Гости и списки | Промоутеры |
+| Редактор и расписание | Гости, промоутеры и ссылки |
 | --- | --- |
-| [![Гостевые списки в админке](docs/screenshots/admin-guests.webp)](docs/screenshots/admin-guests.webp) | [![Промоутеры в админке](docs/screenshots/admin-promoters.webp)](docs/screenshots/admin-promoters.webp) |
-| <sub>Списки, добавление гостей, заметки, QR и отметки входа.</sub> | <sub>Доступ к выбранному списку или сразу ко всем обычным спискам.</sub> |
+| [![Редактор мероприятия](docs/screenshots/admin-event.webp)](docs/screenshots/admin-event.webp) | [![Гостевые списки в админке](docs/screenshots/admin-guests.webp)](docs/screenshots/admin-guests.webp) |
+| <sub>Данные, ссылки, публикация лайнапа и расписание по залам.</sub> | <sub>Списки, промоутеры, саморегистрация, добавление гостей, QR и отметки входа.</sub> |
+
+<p align="center">
+  <a href="docs/screenshots/admin-promoters.webp">
+    <img src="docs/screenshots/admin-promoters.webp"
+         alt="Промоутеры в админке LineUP" width="100%">
+  </a><br>
+  <sub>Промоутеры: доступ к выбранному списку или сразу ко всем обычным спискам.</sub>
+</p>
 
 Больше изображений и подписи к ним — в [docs/screenshots](docs/screenshots/README.md).
 
