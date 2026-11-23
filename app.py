@@ -55,6 +55,11 @@ LOGIN_MAX_FAILURES = int(os.environ.get("LINEUP_LOGIN_MAX_FAILURES", "10") or 10
 LOGIN_MAX_USER_FAILURES = int(os.environ.get("LINEUP_LOGIN_MAX_USER_FAILURES", "20") or 20)
 LOGIN_WINDOW_SECONDS = int(os.environ.get("LINEUP_LOGIN_WINDOW", "900") or 900)
 MAX_BODY_BYTES = 256 * 1024
+MAX_GUESTS_IMPORT_BYTES = max(
+    1024,
+    int(os.environ.get("LINEUP_GUESTS_IMPORT_BYTES", str(1024 * 1024))
+        or 1024 * 1024),
+)
 
 # Через сколько дней после окончания мероприятие перестаёт быть публичным.
 PUBLIC_RETENTION_DAYS = int(
@@ -203,7 +208,11 @@ class Request:
             length = int(self.headers.get("content-length") or 0)
         except ValueError:
             length = 0
-        if length > MAX_BODY_BYTES:
+        limit = MAX_BODY_BYTES
+        if self.path.endswith("/guests/import"):
+            # JSON-обёртка и экранирование добавляют несколько процентов.
+            limit = max(limit, MAX_GUESTS_IMPORT_BYTES + 128 * 1024)
+        if length > limit:
             raise APIError(413, "too_large", "Слишком большой запрос.")
         stream = self.environ.get("wsgi.input")
         self._body = stream.read(length) if length > 0 and stream else b""
@@ -394,7 +403,6 @@ SITE_COPYRIGHT_KEY = "copyright_text"
 SITE_THEME_KEY = "theme"
 MAX_GUEST_LISTS = 20
 MAX_GUESTS_PER_LIST = 5000
-MAX_GUESTS_IMPORT_BYTES = 200 * 1024
 MAX_GUESTS_IMPORT_ROWS = 5000
 GUEST_STATUSES = ("invited", "checked_in")
 # 180 КБ в base64 занимают меньше 256 КБ, лимита тела запроса.
@@ -2420,8 +2428,12 @@ def _parse_guests_csv(text: str) -> list[dict]:
     if not text.strip():
         raise APIError(400, "validation", "CSV пустой.")
     if len(text.encode("utf-8")) > MAX_GUESTS_IMPORT_BYTES:
+        if MAX_GUESTS_IMPORT_BYTES >= 1024 * 1024:
+            limit_label = f"{MAX_GUESTS_IMPORT_BYTES / (1024 * 1024):g} МБ"
+        else:
+            limit_label = f"{MAX_GUESTS_IMPORT_BYTES // 1024} КБ"
         raise APIError(413, "too_large",
-                       "CSV больше 200 КБ. Разделите файл на части.")
+                       f"CSV больше {limit_label}. Разделите файл на части.")
 
     # Excel иногда добавляет строку sep=; перед таблицей.
     lines = text.splitlines()
@@ -3554,6 +3566,7 @@ def api_admin_event_guest_lists(req, event_id):
                 "published": bool(event["published"]),
             },
             "role": role,
+            "importLimitBytes": MAX_GUESTS_IMPORT_BYTES,
             "lists": [_guest_list_json(conn, row) for row in rows],
         })
     finally:

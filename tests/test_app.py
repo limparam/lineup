@@ -1673,10 +1673,12 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(data["stats"]["checkedInCount"], 0)
 
     def test_guest_csv_export_sorting_and_import_creates_lists(self):
+        self.assertEqual(appmod.MAX_GUESTS_IMPORT_BYTES, 1024 * 1024)
         event = self.create_event(title="CSV NIGHT")
         status, _, data = self.client.get(
             f"/api/admin/events/{event['id']}/guest-lists")
         self.assertEqual(status, 200, data)
+        self.assertEqual(data["importLimitBytes"], 1024 * 1024)
         blacklist = next(item for item in data["lists"] if item["isBlacklist"])
         lists = {}
         for name in ("VIP", "Гости"):
@@ -1794,6 +1796,18 @@ class LineUPTestCase(unittest.TestCase):
             csrf=self.client.csrf)
         self.assertEqual(status, 400, data)
         self.assertIn("Список", data["error"]["message"])
+
+        original_limit = appmod.MAX_GUESTS_IMPORT_BYTES
+        try:
+            appmod.MAX_GUESTS_IMPORT_BYTES = 60
+            status, _, data = self.client.post(
+                f"/api/admin/events/{event['id']}/guests/import",
+                {"csv": "Имя;Телефон;Список\n" + "А" * 100 + ";+7 000;VIP"},
+                csrf=self.client.csrf)
+            self.assertEqual(status, 413, data)
+            self.assertIn("CSV больше", data["error"]["message"])
+        finally:
+            appmod.MAX_GUESTS_IMPORT_BYTES = original_limit
 
         # Промоутер видит только свои списки и не может выгрузить весь CSV.
         self.create_admin("csv_promo", "promo-password-2")

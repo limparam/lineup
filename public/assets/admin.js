@@ -54,6 +54,7 @@ let guestRole = "";
 let guestLists = [];
 let activeGuestListId = null;
 let guestItems = [];
+let guestImportLimit = 1024 * 1024;
 let guestSearchTimer = null;
 let editingGuestId = null;
 let availablePromoters = [];
@@ -1153,6 +1154,7 @@ async function reloadGuestLists(query = "") {
   const data = await request(`/api/admin/events/${guestEvent.id}/guest-lists`);
   guestEvent = data.event;
   guestRole = data.role || "owner";
+  guestImportLimit = data.importLimitBytes || guestImportLimit;
   guestLists = data.lists || [];
   if (!guestLists.some((item) => item.id === activeGuestListId)) {
     activeGuestListId = guestLists.length ? guestLists[0].id : null;
@@ -1169,6 +1171,7 @@ function renderGuestTransfer() {
   if (canManage) {
     $("guests-export-csv").href =
       `/api/admin/events/${guestEvent.id}/guests.csv`;
+    $("guests-import-limit").textContent = formatBytes(guestImportLimit);
   }
 }
 
@@ -1181,8 +1184,9 @@ function showGuestTransferError(message) {
 async function importGuestsCsv(file) {
   if (!guestEvent || guestRole !== "owner") return;
   $("guests-import-error").hidden = true;
-  if (file.size > 200 * 1024) {
-    showGuestTransferError("Файл больше 200 КБ. Разделите его на части.");
+  if (file.size > guestImportLimit) {
+    showGuestTransferError(
+      `Файл больше ${formatBytes(guestImportLimit)}. Разделите его на части.`);
     return;
   }
   let text;
@@ -1392,6 +1396,7 @@ async function openGuests(eventId) {
   const data = await request(`/api/admin/events/${eventId}/guest-lists`);
   guestEvent = data.event;
   guestRole = data.role || "owner";
+  guestImportLimit = data.importLimitBytes || guestImportLimit;
   guestLists = data.lists || [];
   activeGuestListId = guestLists.length ? guestLists[0].id : null;
   $("guest-search").value = "";

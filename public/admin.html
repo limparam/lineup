@@ -383,7 +383,8 @@
           открыть в Excel, если на площадке нет интернета.<br>
           <b>Импорт:</b> нужны колонки «Имя», «Телефон», «Список». Новые списки
           создаются автоматически, дубликаты по имени и телефону в одном списке
-          пропускаются. Файл — UTF-8, до 200 КБ; разделитель «;» или «,».
+          пропускаются. Файл — UTF-8, до
+          <span id="guests-import-limit">1 МБ</span>; разделитель «;» или «,».
         </p>
         <p class="form-error" id="guests-import-error" role="alert" hidden></p>
       </div>
@@ -836,6 +837,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=48"></script>
+  <script type="module" src="/assets/admin.js?v=49"></script>
 </body>
 </html>
