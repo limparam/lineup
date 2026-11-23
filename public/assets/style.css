@@ -2876,6 +2876,22 @@ dialog .stack {
   gap: 10px;
 }
 
+.guest-transfer-panel {
+  margin-top: 18px;
+}
+
+.guest-transfer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.guest-transfer-panel .field__hint {
+  margin: 0;
+  line-height: 1.55;
+}
+
 .guest-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

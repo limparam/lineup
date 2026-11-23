@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=30">
+  <link rel="stylesheet" href="/assets/style.css?v=32">
 </head>
 <body>
   <header class="adminbar">
@@ -362,6 +362,30 @@
           <span class="muted small" id="guest-count"></span>
         </div>
         <div class="guest-list" id="guest-list"></div>
+      </div>
+
+      <div class="panel guest-transfer-panel" id="guest-transfer-panel" hidden>
+        <div class="panel__head">
+          <h2 class="panel__title">Экспорт и импорт гостей</h2>
+          <span class="muted small">CSV для работы без интернета</span>
+        </div>
+        <div class="guest-transfer-actions">
+          <a class="btn btn--ghost btn--sm" id="guests-export-csv"
+             href="#">Скачать CSV</a>
+          <button class="btn btn--ghost btn--sm" id="guests-import-csv"
+                  type="button">Импортировать CSV</button>
+          <input id="guests-import-file" type="file"
+                 accept=".csv,text/csv" hidden>
+        </div>
+        <p class="field__hint">
+          <b>Экспорт:</b> имя, телефон и список — все гости мероприятия одним
+          файлом, по спискам и алфавиту внутри списка. Удобно распечатать или
+          открыть в Excel, если на площадке нет интернета.<br>
+          <b>Импорт:</b> нужны колонки «Имя», «Телефон», «Список». Новые списки
+          создаются автоматически, дубликаты по имени и телефону в одном списке
+          пропускаются. Файл — UTF-8, до 200 КБ; разделитель «;» или «,».
+        </p>
+        <p class="form-error" id="guests-import-error" role="alert" hidden></p>
       </div>
     </section>
 
@@ -812,6 +836,6 @@
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=47"></script>
+  <script type="module" src="/assets/admin.js?v=48"></script>
 </body>
 </html>

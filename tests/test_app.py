@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import io
 import json
 import os
@@ -1670,6 +1671,150 @@ class LineUPTestCase(unittest.TestCase):
         self.assertEqual(data["results"][0]["status"], "applied")
         self.assertEqual(data["updated"][0]["status"], "invited")
         self.assertEqual(data["stats"]["checkedInCount"], 0)
+
+    def test_guest_csv_export_sorting_and_import_creates_lists(self):
+        event = self.create_event(title="CSV NIGHT")
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/guest-lists")
+        self.assertEqual(status, 200, data)
+        blacklist = next(item for item in data["lists"] if item["isBlacklist"])
+        lists = {}
+        for name in ("VIP", "Гости"):
+            status, _, data = self.client.post(
+                f"/api/admin/events/{event['id']}/guest-lists",
+                {"name": name}, csrf=self.client.csrf)
+            self.assertEqual(status, 201, data)
+            lists[name] = data["list"]["id"]
+
+        def add_guest(list_id, name, phone):
+            status, _, data = self.client.post(
+                f"/api/admin/guest-lists/{list_id}/guests",
+                {"name": name, "phone": phone}, csrf=self.client.csrf)
+            self.assertEqual(status, 201, data)
+            return data["guest"]
+
+        anna_phone = "+7 900 000-00-02"
+        add_guest(lists["VIP"], "Яна", "+7 900 000-00-01")
+        add_guest(lists["VIP"], "Анна", anna_phone)
+        add_guest(lists["Гости"], "Борис", "+7 900 000-00-03")
+        add_guest(lists["Гости"], "Алина", "+7 900 000-00-04")
+        add_guest(blacklist["id"], "Виктор", "+7 900 000-00-05")
+
+        status, headers, _ = self.client.get(
+            f"/api/admin/events/{event['id']}/guests.csv")
+        self.assertEqual(status, 200)
+        self.assertIn("text/csv", headers["content-type"])
+        self.assertIn("attachment", headers["content-disposition"])
+        exported = self.client.last_body.decode("utf-8")
+        self.assertTrue(exported.startswith("\ufeff"))
+        rows = list(csv.reader(io.StringIO(exported.lstrip("\ufeff")),
+                               delimiter=";"))
+        self.assertEqual(rows[0], ["Имя", "Телефон", "Список"])
+        self.assertEqual(
+            [row[0] for row in rows[1:]],
+            ["Анна", "Яна", "Алина", "Борис", "Виктор"])
+        self.assertEqual(
+            [row[2] for row in rows[1:]],
+            ["VIP", "VIP", "Гости", "Гости", "Чёрный список"])
+
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n")
+        writer.writerow(["Имя", "Телефон", "Список"])
+        names = ["VIP", "Гости", "Фото", "Пресса"]
+        for index in range(1, 31):
+            writer.writerow([
+                f"Импорт {index:02d}",
+                f"+7 901 000-{index:04d}",
+                names[(index - 1) % len(names)],
+            ])
+        writer.writerow(["Анна", anna_phone, "VIP"])
+        writer.writerow(["", "+7 900 000-00-99", "VIP"])
+        csv_text = buffer.getvalue()
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guests/import",
+            {"csv": csv_text}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["created"], 30)
+        self.assertEqual(data["duplicates"], 1)
+        self.assertEqual(data["errorCount"], 1)
+        self.assertEqual(data["listsCreated"], ["Фото", "Пресса"])
+        self.assertEqual(data["totalRows"], 32)
+
+        conn = db.connect()
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM guests WHERE event_id = ?",
+                (event["id"],)).fetchone()[0], 35)
+            for list_name, expected in (
+                    ("VIP", 10), ("Гости", 10), ("Фото", 7), ("Пресса", 7)):
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM guests g JOIN guest_lists gl "
+                    "ON gl.id = g.list_id WHERE gl.event_id = ? "
+                    "AND gl.name = ?", (event["id"], list_name)).fetchone()[0]
+                self.assertEqual(count, expected, list_name)
+            imported = conn.execute(
+                "SELECT status, share_token FROM guests "
+                "WHERE event_id = ? AND name = 'Импорт 01'",
+                (event["id"],)).fetchone()
+            self.assertEqual(imported["status"], "invited")
+            self.assertTrue(imported["share_token"])
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM guest_lists WHERE event_id = ? "
+                "AND is_blacklist = 0", (event["id"],)).fetchone()[0], 4)
+        finally:
+            conn.close()
+
+        # Повторный импорт не создаёт дублей.
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guests/import",
+            {"csv": csv_text}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["created"], 0)
+        self.assertEqual(data["duplicates"], 31)
+        self.assertEqual(data["errorCount"], 1)
+        self.assertEqual(data["listsCreated"], [])
+
+        # Запятая, английские заголовки и строка sep=, от Excel.
+        comma_csv = (
+            "sep=,\r\n"
+            "Name,Phone,List\r\n"
+            '"Гость, с запятой",+7 902 000-00-01,Пресса\r\n'
+        )
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guests/import",
+            {"csv": comma_csv}, csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["created"], 1)
+        self.assertEqual(data["listsCreated"], [])
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/guests/import",
+            {"csv": "Имя;Телефон\nБез списка;+7 000"},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+        self.assertIn("Список", data["error"]["message"])
+
+        # Промоутер видит только свои списки и не может выгрузить весь CSV.
+        self.create_admin("csv_promo", "promo-password-2")
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/promoters",
+            {"username": "csv_promo", "listId": lists["VIP"]},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        promo = Client(self)
+        status, _, data = promo.post(
+            "/api/admin/login",
+            {"username": "csv_promo", "password": "promo-password-2"})
+        self.assertEqual(status, 200, data)
+        promo.csrf = data["csrfToken"]
+        status, _, _ = promo.get(
+            f"/api/admin/events/{event['id']}/guests.csv")
+        self.assertEqual(status, 403)
+        status, _, _ = promo.post(
+            f"/api/admin/events/{event['id']}/guests/import",
+            {"csv": csv_text}, csrf=promo.csrf)
+        self.assertEqual(status, 403)
 
     def test_guest_list_validation_and_public_visibility(self):
         event = self.create_event(title="GUEST VALIDATION")

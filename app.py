@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import csv
 import hashlib
 import io
 import json
@@ -393,6 +394,8 @@ SITE_COPYRIGHT_KEY = "copyright_text"
 SITE_THEME_KEY = "theme"
 MAX_GUEST_LISTS = 20
 MAX_GUESTS_PER_LIST = 5000
+MAX_GUESTS_IMPORT_BYTES = 200 * 1024
+MAX_GUESTS_IMPORT_ROWS = 5000
 GUEST_STATUSES = ("invited", "checked_in")
 # 180 КБ в base64 занимают меньше 256 КБ, лимита тела запроса.
 MAX_LOGO_BYTES = 180 * 1024
@@ -2401,6 +2404,103 @@ def _new_guest_token(conn) -> str:
     raise APIError(500, "server_error", "Не удалось создать QR-код гостя.")
 
 
+CSV_GUEST_HEADERS = {
+    "name": {"имя", "имя гостя", "name", "guest", "guest name"},
+    "phone": {"телефон", "тел", "phone", "tel", "phone number"},
+    "list": {"список", "гостевой список", "list", "list name"},
+}
+
+
+def _parse_guests_csv(text: str) -> list[dict]:
+    """Разбирает CSV гостей: имя, телефон, список. Заголовки обязательны."""
+    if not isinstance(text, str):
+        raise APIError(400, "validation", "CSV должен быть текстом.")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    if not text.strip():
+        raise APIError(400, "validation", "CSV пустой.")
+    if len(text.encode("utf-8")) > MAX_GUESTS_IMPORT_BYTES:
+        raise APIError(413, "too_large",
+                       "CSV больше 200 КБ. Разделите файл на части.")
+
+    # Excel иногда добавляет строку sep=; перед таблицей.
+    lines = text.splitlines()
+    if lines and lines[0].strip().lower().startswith("sep="):
+        text = "\n".join(lines[1:])
+        lines = text.splitlines()
+    sample = "\n".join(line for line in lines[:10] if line.strip())
+    delimiter = ";"
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        if sample.count(",") > sample.count(";"):
+            delimiter = ","
+
+    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    header_index = next(
+        (index for index, row in enumerate(rows)
+         if any(cell.strip() for cell in row)), None)
+    if header_index is None:
+        raise APIError(400, "validation", "В CSV нет строки с заголовками.")
+    header = [cell.strip().lstrip("\ufeff").casefold()
+              for cell in rows[header_index]]
+    indexes = {}
+    for key, aliases in CSV_GUEST_HEADERS.items():
+        indexes[key] = next(
+            (index for index, cell in enumerate(header) if cell in aliases),
+            None)
+    missing = [label for key, label in (
+        ("name", "Имя"), ("phone", "Телефон"), ("list", "Список"))
+        if indexes[key] is None]
+    if missing:
+        raise APIError(
+            400, "validation",
+            "В CSV нет колонок: " + ", ".join(missing)
+            + ". Нужны заголовки «Имя», «Телефон», «Список».")
+
+    records = []
+    for offset, row in enumerate(rows[header_index + 1:],
+                                 start=header_index + 2):
+        def cell(key):
+            index = indexes[key]
+            return row[index].strip() if index < len(row) else ""
+
+        name = cell("name")
+        phone = cell("phone")
+        list_name = cell("list")
+        if not (name or phone or list_name):
+            continue
+        if not name:
+            records.append({"line": offset, "error": "Не указано имя."})
+            continue
+        if len(name) > 120:
+            records.append({"line": offset, "error": "Имя длиннее 120 символов."})
+            continue
+        if len(phone) > 40:
+            records.append({"line": offset, "error": "Телефон длиннее 40 символов."})
+            continue
+        if not list_name:
+            records.append({"line": offset, "error": "Не указан список."})
+            continue
+        if len(list_name) > 60:
+            records.append({"line": offset, "error": "Список длиннее 60 символов."})
+            continue
+        records.append({
+            "line": offset, "name": name, "phone": phone,
+            "list_name": list_name,
+        })
+        if len(records) > MAX_GUESTS_IMPORT_ROWS:
+            raise APIError(400, "validation",
+                           f"В CSV больше {MAX_GUESTS_IMPORT_ROWS} строк.")
+    return records
+
+
+def _guest_import_key(name: str, phone: str) -> tuple[str, str]:
+    return ((name or "").strip().casefold(),
+            re.sub(r"\D", "", phone or ""))
+
+
 def _guest_json(row) -> dict:
     return {
         "id": row["id"],
@@ -3455,6 +3555,171 @@ def api_admin_event_guest_lists(req, event_id):
             },
             "role": role,
             "lists": [_guest_list_json(conn, row) for row in rows],
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/guests\.csv")
+def api_admin_event_guests_csv(req, event_id):
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Экспорт доступен только организатору мероприятия.")
+        rows = conn.execute(
+            "SELECT g.name, g.phone, gl.name AS list_name "
+            "FROM guests g JOIN guest_lists gl ON gl.id = g.list_id "
+            "WHERE g.event_id = ? "
+            "ORDER BY gl.is_blacklist, gl.position, gl.id, "
+            "g.name COLLATE NOCASE, g.id",
+            (event["id"],),
+        ).fetchall()
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n")
+        writer.writerow(["Имя", "Телефон", "Список"])
+        for row in rows:
+            writer.writerow([row["name"], row["phone"], row["list_name"]])
+        body = ("\ufeff" + buffer.getvalue()).encode("utf-8")
+        filename = f"lineup-{event['slug']}-guests.csv"
+        return Response(
+            body, 200, content_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/guests/import", methods=("POST",))
+def api_admin_event_guests_import(req, event_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(
+                403, "forbidden",
+                "Импорт доступен только организатору мероприятия.")
+        records = _parse_guests_csv(data.get("csv"))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            db.ensure_blacklist(conn, event["id"], event["owner_id"])
+            now = timeutil.iso_now()
+            lists = conn.execute(
+                "SELECT id, name, is_blacklist, position FROM guest_lists "
+                "WHERE event_id = ? ORDER BY position, id",
+                (event["id"],),
+            ).fetchall()
+            by_name = {row["name"].strip().casefold(): dict(row)
+                       for row in lists}
+            max_position = max((int(row["position"]) for row in lists),
+                               default=0)
+            counts = {
+                row["id"]: conn.execute(
+                    "SELECT COUNT(*) FROM guests WHERE list_id = ?",
+                    (row["id"],),
+                ).fetchone()[0]
+                for row in lists
+            }
+            existing = {
+                (row["list_id"], *_guest_import_key(row["name"], row["phone"]))
+                for row in conn.execute(
+                    "SELECT list_id, name, phone FROM guests WHERE event_id = ?",
+                    (event["id"],),
+                )
+            }
+            created = 0
+            duplicates = 0
+            created_lists = []
+            errors = []
+            for record in records:
+                if record.get("error"):
+                    errors.append({
+                        "line": record["line"],
+                        "message": record["error"],
+                    })
+                    continue
+                list_key = record["list_name"].strip().casefold()
+                target = by_name.get(list_key)
+                if target is None:
+                    if len(lists) >= MAX_GUEST_LISTS:
+                        errors.append({
+                            "line": record["line"],
+                            "message": (f"Нельзя создать список "
+                                        f"«{record['list_name']}»: "
+                                        f"достигнут лимит {MAX_GUEST_LISTS}."),
+                        })
+                        continue
+                    max_position += 1
+                    cur = conn.execute(
+                        "INSERT INTO guest_lists (event_id, name, created_by, "
+                        "created_at, position) VALUES (?, ?, ?, ?, ?)",
+                        (event["id"], record["list_name"], session["user_id"],
+                         now, max_position),
+                    )
+                    list_id = int(cur.lastrowid)
+                    target = {
+                        "id": list_id,
+                        "name": record["list_name"],
+                        "is_blacklist": 0,
+                        "position": max_position,
+                    }
+                    lists.append(target)
+                    by_name[list_key] = target
+                    counts[list_id] = 0
+                    created_lists.append(record["list_name"])
+                duplicate_key = (
+                    target["id"],
+                    *_guest_import_key(record["name"], record["phone"]),
+                )
+                if duplicate_key in existing:
+                    duplicates += 1
+                    continue
+                if counts.get(target["id"], 0) >= MAX_GUESTS_PER_LIST:
+                    errors.append({
+                        "line": record["line"],
+                        "message": (f"В списке «{target['name']}» уже "
+                                    f"{MAX_GUESTS_PER_LIST} гостей."),
+                    })
+                    continue
+                token = _new_guest_token(conn)
+                conn.execute(
+                    "INSERT INTO guests (list_id, event_id, name, phone, "
+                    "table_name, notes, status, share_token, created_by, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, '', '', 'invited', ?, ?, ?, ?)",
+                    (target["id"], event["id"], record["name"],
+                     record["phone"], token, session["user_id"], now, now),
+                )
+                existing.add(duplicate_key)
+                counts[target["id"]] = counts.get(target["id"], 0) + 1
+                created += 1
+            if created:
+                _audit(
+                    conn, session, "guests.import", entity="event",
+                    entity_id=event["id"], event_id=event["id"],
+                    detail=(f"{event['title']} · импорт CSV · гостей: {created}"
+                            + (f" · новых списков: {len(created_lists)}"
+                               if created_lists else "")),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return json_response({
+            "created": created,
+            "duplicates": duplicates,
+            "listsCreated": created_lists,
+            "totalRows": len(records),
+            "errorCount": len(errors),
+            "errors": errors[:20],
         })
     finally:
         conn.close()

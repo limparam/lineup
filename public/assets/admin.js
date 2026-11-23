@@ -1132,6 +1132,7 @@ function renderGuestView() {
   renderGuestStats();
   renderGuestCards();
   renderRegistrationLinks();
+  renderGuestTransfer();
 }
 
 async function loadGuestItems(query = "") {
@@ -1158,6 +1159,99 @@ async function reloadGuestLists(query = "") {
   }
   renderGuestView();
   await loadGuestItems(query);
+}
+
+function renderGuestTransfer() {
+  const panel = $("guest-transfer-panel");
+  if (!panel) return;
+  const canManage = Boolean(guestEvent && guestRole === "owner");
+  panel.hidden = !canManage;
+  if (canManage) {
+    $("guests-export-csv").href =
+      `/api/admin/events/${guestEvent.id}/guests.csv`;
+  }
+}
+
+function showGuestTransferError(message) {
+  const box = $("guests-import-error");
+  box.textContent = message;
+  box.hidden = false;
+}
+
+async function importGuestsCsv(file) {
+  if (!guestEvent || guestRole !== "owner") return;
+  $("guests-import-error").hidden = true;
+  if (file.size > 200 * 1024) {
+    showGuestTransferError("Файл больше 200 КБ. Разделите его на части.");
+    return;
+  }
+  let text;
+  try {
+    text = await file.text();
+  } catch {
+    showGuestTransferError("Не удалось прочитать файл.");
+    return;
+  }
+  const button = $("guests-import-csv");
+  setBusy(button, true);
+  try {
+    const data = await request(
+      `/api/admin/events/${guestEvent.id}/guests/import`,
+      { method: "POST", body: { csv: text } },
+    );
+    $("guests-import-file").value = "";
+    const parts = [];
+    if (data.created) parts.push(`добавлено: ${data.created}`);
+    if (data.listsCreated && data.listsCreated.length) {
+      parts.push(`новых списков: ${data.listsCreated.length}`);
+    }
+    if (data.duplicates) parts.push(`дубликатов: ${data.duplicates}`);
+    if (data.errorCount) parts.push(`ошибок: ${data.errorCount}`);
+    const summary = parts.length ? parts.join(" · ") : "новых гостей нет";
+    if (data.errors && data.errors.length) {
+      const lines = data.errors.map(
+        (item) => `Строка ${item.line}: ${item.message}`);
+      if (data.errorCount > data.errors.length) {
+        lines.push(`Ещё ошибок: ${data.errorCount - data.errors.length}.`);
+      }
+      showGuestTransferError(lines.join(" "));
+    }
+    await reloadGuestLists($("guest-search").value.trim());
+    toast(`Импорт CSV: ${summary}`, data.errorCount ? "error" : "ok");
+  } catch (error) {
+    showGuestTransferError(error.message);
+    toast(error.message, "error");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function downloadGuestsCsv() {
+  if (!guestEvent || guestRole !== "owner") return;
+  const response = await fetch(
+    `/api/admin/events/${guestEvent.id}/guests.csv`,
+    { credentials: "same-origin", cache: "no-store" },
+  );
+  if (!response.ok) {
+    let message = "Не удалось скачать CSV";
+    try {
+      const data = await response.json();
+      message = (data.error && data.error.message) || message;
+    } catch {
+      /* ответ не JSON — оставляем общий текст */
+    }
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = `lineup-${guestEvent.slug}-guests.csv`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 1000);
+  toast("CSV с гостями скачан");
 }
 
 function showPromoterError(message) {
@@ -3222,6 +3316,22 @@ $("registration-link-expiry").addEventListener(
 $("guest-list-cancel").addEventListener("click", () => $("guest-list-dialog").close());
 $("guest-list-form").addEventListener("submit", createGuestList);
 $("guest-add-form").addEventListener("submit", createGuest);
+$("guests-import-csv").addEventListener("click", () => {
+  $("guests-import-file").click();
+});
+$("guests-import-file").addEventListener("change", () => {
+  const file = $("guests-import-file").files[0];
+  if (!file) return;
+  importGuestsCsv(file).catch((error) => toast(error.message, "error"));
+});
+$("guests-export-csv").addEventListener("click", (event) => {
+  event.preventDefault();
+  if (!guestEvent || guestRole !== "owner") {
+    toast("Экспорт доступен только организатору мероприятия", "error");
+    return;
+  }
+  downloadGuestsCsv().catch((error) => toast(error.message, "error"));
+});
 $("guest-list-select").addEventListener("change", () => {
   activeGuestListId = Number($("guest-list-select").value) || null;
   guestItems = [];
