@@ -222,6 +222,22 @@ gunicorn (3 воркера), SQLite, демо-база, локальная се�
 | [![Саморегистрация гостя](docs/screenshots/mobile-registration.webp)](docs/screenshots/mobile-registration.webp) | [![Режим охраны с оффлайн-копией](docs/screenshots/mobile-door.webp)](docs/screenshots/mobile-door.webp) | [![Оффлайн-отметка входа](docs/screenshots/mobile-door-offline.webp)](docs/screenshots/mobile-door-offline.webp) |
 | <sub>Имя и телефон, лимит мест, сразу персональный QR.</sub> | <sub>Поиск гостя, VIP-стол и статус оффлайн-копии.</sub> | <sub>Отметка без связи: действие ждёт отправки.</sub> |
 
+### Экран для TV
+
+| Main Stage | Loft |
+| --- | --- |
+| [![TV-экран Main Stage](docs/screenshots/tv-main.webp)](docs/screenshots/tv-main.webp) | [![TV-экран Loft](docs/screenshots/tv-loft.webp)](docs/screenshots/tv-loft.webp) |
+| <sub>Крупный текущий артист, зал и следующий сет.</sub> | <sub>Две строки в разные стороны, градиент имени и размер на весь экран.</sub> |
+
+<p align="center">
+  <a href="docs/screenshots/tv-settings.webp">
+    <img src="docs/screenshots/tv-settings.webp"
+         alt="Редактор TV: отдельная ссылка и оформление для каждого зала"
+         width="100%">
+  </a><br>
+  <sub>У каждого зала своя ссылка и оформление: шрифт, размер, скорость, цвета и эффекты.</sub>
+</p>
+
 ### Админка
 
 <p align="center">
