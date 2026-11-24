@@ -176,6 +176,21 @@ CREATE TABLE IF NOT EXISTS event_door_links (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS event_tv_links (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    hall_id    INTEGER NOT NULL REFERENCES halls(id) ON DELETE CASCADE,
+    token      TEXT NOT NULL UNIQUE,
+    settings   TEXT NOT NULL DEFAULT '{}',
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (event_id, hall_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tv_token ON event_tv_links(token);
+CREATE INDEX IF NOT EXISTS idx_tv_hall ON event_tv_links(hall_id);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     actor_id   INTEGER,

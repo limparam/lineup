@@ -7,7 +7,7 @@
   <title>Админка — LineUP</title>
   <meta name="theme-color" content="#06070a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=32">
+  <link rel="stylesheet" href="/assets/style.css?v=34">
 </head>
 <body>
   <header class="adminbar">
@@ -87,6 +87,10 @@
           <a class="btn btn--ghost btn--sm" id="open-public" href="/" target="_blank" rel="noopener">
             Открыть на сайте ↗
           </a>
+          <button class="btn btn--ghost btn--sm" id="tv-link-btn" type="button"
+                  title="Сгенерировать ссылку для TV">
+            Ссылка для TV
+          </button>
         </div>
       </div>
 
@@ -834,9 +838,136 @@
     </form>
   </dialog>
 
+  <dialog id="tv-dialog" class="tv-dialog">
+    <h2>Экран для TV</h2>
+    <p class="auth__sub">
+      Полноэкранная страница для телевизора за диджеем: показывает, кто играет
+      сейчас, и при необходимости — следующего исполнителя.
+    </p>
+    <form id="tv-form" class="stack" novalidate>
+      <div class="field">
+        <label for="tv-hall-select">Зал</label>
+        <select id="tv-hall-select"></select>
+        <span class="field__hint">
+          У каждого зала своя TV-ссылка и своё оформление.
+        </span>
+      </div>
+
+      <div class="field">
+        <label for="tv-url">Ссылка для TV</label>
+        <input id="tv-url" type="text" readonly>
+        <div class="tv-link-actions">
+          <button class="btn btn--ghost btn--sm" id="tv-copy" type="button">
+            Скопировать
+          </button>
+          <a class="btn btn--ghost btn--sm" id="tv-open" href="#"
+             target="_blank" rel="noopener">Открыть TV ↗</a>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="tv-bg-mode">Фон</label>
+          <select id="tv-bg-mode">
+            <option value="gradient">Градиент</option>
+            <option value="solid">Один цвет</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="tv-font">Шрифт</label>
+          <select id="tv-font"></select>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="tv-font-size">Размер шрифта</label>
+          <select id="tv-font-size">
+            <option value="normal">Обычный</option>
+            <option value="large">Крупнее</option>
+            <option value="fill">Почти на весь экран</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="tv-effect">Эффект</label>
+          <select id="tv-effect">
+            <option value="marquee">Бегущая строка</option>
+            <option value="marquee2">Две строки в разные стороны</option>
+            <option value="static">Без движения</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="tv-speed">Скорость строки</label>
+          <select id="tv-speed">
+            <option value="slow">Медленно</option>
+            <option value="normal">Обычная</option>
+            <option value="fast">Быстро</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="tv-name-color">Цвет имени</label>
+          <input id="tv-name-color" type="color">
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="tv-bg">Цвет фона</label>
+          <input id="tv-bg" type="color">
+        </div>
+      </div>
+
+      <div class="field-row" id="tv-bg-gradient-row">
+        <div class="field">
+          <label for="tv-bg-from">Градиент фона: от</label>
+          <input id="tv-bg-from" type="color">
+        </div>
+        <div class="field">
+          <label for="tv-bg-to">Градиент фона: до</label>
+          <input id="tv-bg-to" type="color">
+        </div>
+      </div>
+
+      <label class="check">
+        <input id="tv-name-gradient" type="checkbox">
+        <span>Градиент имени исполнителя</span>
+      </label>
+
+      <div class="field-row" id="tv-name-gradient-row" hidden>
+        <div class="field">
+          <label for="tv-name-from">Градиент имени: от</label>
+          <input id="tv-name-from" type="color">
+        </div>
+        <div class="field">
+          <label for="tv-name-to">Градиент имени: до</label>
+          <input id="tv-name-to" type="color">
+        </div>
+      </div>
+
+      <label class="check">
+        <input id="tv-show-next" type="checkbox">
+        <span>Показывать внизу следующего исполнителя</span>
+      </label>
+
+      <p class="field__hint">
+        Ссылка публичная и работает сразу. Пока лайнап не опубликован, на экране
+        показывается заглушка «Лайнап скоро»; после открытия расписания экран
+        включится сам. Изменения появляются в течение 15 секунд.
+      </p>
+      <p class="form-error" id="tv-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button class="btn btn--ghost" id="tv-close" type="button">Закрыть</button>
+        <button class="btn btn--primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
   <datalist id="performers-list"></datalist>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script type="module" src="/assets/admin.js?v=49"></script>
+  <script type="module" src="/assets/admin.js?v=52"></script>
 </body>
 </html>

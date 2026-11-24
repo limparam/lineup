@@ -86,6 +86,75 @@ CSP = (
     "style-src 'self'; script-src 'self'; font-src 'self'; connect-src 'self'"
 )
 
+TV_FONTS = [
+    {"id": "system",
+     "label": "Системный — SF Pro / Roboto / Segoe UI / Ubuntu",
+     "family": ("system-ui, -apple-system, BlinkMacSystemFont, "
+                "'Segoe UI', Roboto, Ubuntu, Cantarell, 'Helvetica Neue', "
+                "Arial, sans-serif")},
+    {"id": "arial",
+     "label": "Arial / Liberation Sans",
+     "family": "Arial, 'Liberation Sans', Helvetica, sans-serif"},
+    {"id": "helvetica",
+     "label": "Helvetica Neue",
+     "family": "'Helvetica Neue', Helvetica, Arial, sans-serif"},
+    {"id": "roboto",
+     "label": "Roboto (Android)",
+     "family": "Roboto, 'Segoe UI', Arial, sans-serif"},
+    {"id": "segoe",
+     "label": "Segoe UI (Windows)",
+     "family": "'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"},
+    {"id": "sf",
+     "label": "SF Pro (iOS / macOS)",
+     "family": ("'SF Pro Display', -apple-system, BlinkMacSystemFont, "
+                "'Segoe UI', Roboto, sans-serif")},
+    {"id": "verdana",
+     "label": "Verdana",
+     "family": "Verdana, Geneva, 'DejaVu Sans', sans-serif"},
+    {"id": "tahoma",
+     "label": "Tahoma",
+     "family": "Tahoma, Verdana, 'DejaVu Sans', sans-serif"},
+    {"id": "trebuchet",
+     "label": "Trebuchet MS",
+     "family": "'Trebuchet MS', 'DejaVu Sans', Helvetica, sans-serif"},
+    {"id": "georgia",
+     "label": "Georgia",
+     "family": "Georgia, 'Liberation Serif', 'Times New Roman', serif"},
+    {"id": "times",
+     "label": "Times New Roman / Liberation Serif",
+     "family": "'Times New Roman', 'Liberation Serif', Times, serif"},
+    {"id": "courier",
+     "label": "Courier New / Liberation Mono",
+     "family": "'Courier New', 'Liberation Mono', Courier, monospace"},
+    {"id": "impact",
+     "label": "Impact",
+     "family": "Impact, Haettenschweiler, 'Arial Narrow Bold', sans-serif"},
+    {"id": "arial-black",
+     "label": "Arial Black",
+     "family": "'Arial Black', 'Arial Bold', Gadget, sans-serif"},
+    {"id": "palatino",
+     "label": "Palatino",
+     "family": ("'Palatino Linotype', 'Book Antiqua', Palatino, "
+                "'URW Palladio L', serif")},
+]
+TV_FONT_MAP = {item["id"]: item for item in TV_FONTS}
+TV_EFFECTS = ("static", "marquee", "marquee2")
+TV_DEFAULT_SETTINGS = {
+    "backgroundMode": "gradient",
+    "background": "#05070a",
+    "backgroundFrom": "#05070a",
+    "backgroundTo": "#0b3d2e",
+    "font": "system",
+    "fontSize": "normal",
+    "nameColor": "#14ff8c",
+    "nameGradient": False,
+    "nameFrom": "#14ff8c",
+    "nameTo": "#39c6ff",
+    "effect": "marquee",
+    "speed": "normal",
+    "showNext": True,
+}
+
 _IP_RE = re.compile(r"[0-9a-fA-F:.]{2,45}")
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 
@@ -393,6 +462,105 @@ def _perf_admin_json(row, tz: str) -> dict:
     data["startsAtLocal"] = timeutil.to_local_input(timeutil.parse_iso(row["starts_at"]), tz)
     data["endsAtLocal"] = timeutil.to_local_input(timeutil.parse_iso(row["ends_at"]), tz)
     return data
+
+
+def _tv_settings(row) -> dict:
+    settings = dict(TV_DEFAULT_SETTINGS)
+    try:
+        saved = json.loads(row["settings"] or "{}")
+    except (TypeError, ValueError):
+        saved = {}
+    if isinstance(saved, dict):
+        for key in TV_DEFAULT_SETTINGS:
+            if key in saved:
+                settings[key] = saved[key]
+    if settings.get("font") not in TV_FONT_MAP:
+        settings["font"] = TV_DEFAULT_SETTINGS["font"]
+    if settings.get("fontSize") not in ("normal", "large", "fill"):
+        settings["fontSize"] = TV_DEFAULT_SETTINGS["fontSize"]
+    if settings.get("effect") not in TV_EFFECTS:
+        settings["effect"] = TV_DEFAULT_SETTINGS["effect"]
+    if settings.get("speed") not in ("slow", "normal", "fast"):
+        settings["speed"] = TV_DEFAULT_SETTINGS["speed"]
+    if settings.get("backgroundMode") not in ("solid", "gradient"):
+        settings["backgroundMode"] = TV_DEFAULT_SETTINGS["backgroundMode"]
+    for key in ("background", "backgroundFrom", "backgroundTo",
+                "nameColor", "nameFrom", "nameTo"):
+        value = settings.get(key)
+        if not isinstance(value, str) or not HEX_COLOR_RE.fullmatch(value):
+            settings[key] = TV_DEFAULT_SETTINGS[key]
+    settings["nameGradient"] = bool(settings.get("nameGradient"))
+    settings["showNext"] = bool(settings.get("showNext"))
+    return settings
+
+
+def _normalize_tv_settings(conn, event_id: int, data) -> dict:
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise APIError(400, "validation", "Настройки TV должны быть объектом.")
+    settings = dict(TV_DEFAULT_SETTINGS)
+    for key in ("background", "backgroundFrom", "backgroundTo",
+                "nameColor", "nameFrom", "nameTo"):
+        if key not in data:
+            continue
+        value = data.get(key)
+        if not isinstance(value, str) or not HEX_COLOR_RE.fullmatch(value):
+            raise APIError(400, "validation",
+                           "Цвета должны быть в формате #RRGGBB.")
+        settings[key] = value.lower()
+    mode = data.get("backgroundMode", settings["backgroundMode"])
+    if mode not in ("solid", "gradient"):
+        raise APIError(400, "validation", "Некорректный режим фона.")
+    settings["backgroundMode"] = mode
+    font = data.get("font", settings["font"])
+    if font not in TV_FONT_MAP:
+        raise APIError(400, "validation", "Неизвестный шрифт.")
+    settings["font"] = font
+    font_size = data.get("fontSize", settings["fontSize"])
+    if font_size not in ("normal", "large", "fill"):
+        raise APIError(400, "validation", "Некорректный размер шрифта.")
+    settings["fontSize"] = font_size
+    effect = data.get("effect", settings["effect"])
+    if effect not in TV_EFFECTS:
+        raise APIError(400, "validation", "Неизвестный эффект.")
+    settings["effect"] = effect
+    speed = data.get("speed", settings["speed"])
+    if speed not in ("slow", "normal", "fast"):
+        raise APIError(400, "validation", "Некорректная скорость.")
+    settings["speed"] = speed
+    for key in ("nameGradient", "showNext"):
+        value = data.get(key, settings[key])
+        if not isinstance(value, bool):
+            raise APIError(400, "validation",
+                           "Переключатели должны быть true или false.")
+        settings[key] = value
+    return settings
+
+
+def _tv_link_row(conn, token: str):
+    return conn.execute(
+        "SELECT * FROM event_tv_links WHERE token = ?", (token,),
+    ).fetchone()
+
+
+def _tv_link_payload(conn, event, row) -> dict:
+    settings = _tv_settings(row)
+    settings["fontFamily"] = TV_FONT_MAP[settings["font"]]["family"]
+    halls = conn.execute(
+        "SELECT id, name FROM halls WHERE event_id = ? ORDER BY position, id",
+        (event["id"],),
+    ).fetchall()
+    hall = next(
+        (item for item in halls if item["id"] == row["hall_id"]), None)
+    return {
+        "path": f"/tv/{row['token']}",
+        "hall": ({"id": hall["id"], "name": hall["name"]}
+                 if hall else None),
+        "settings": settings,
+        "fonts": TV_FONTS,
+        "halls": [{"id": item["id"], "name": item["name"]} for item in halls],
+    }
 
 
 MAX_EVENT_LINKS = 12
@@ -1254,6 +1422,11 @@ def page_door(req, token):
     resp.headers["Permissions-Policy"] = (
         "geolocation=(), microphone=(), camera=(self), payment=()")
     return resp
+
+
+@route(r"/tv/([A-Za-z0-9_-]{16,80})")
+def page_tv(req, token):
+    return _serve_static(req, "tv.html", cache="no-cache")
 
 
 @route(r"/api/door/([A-Za-z0-9_-]{16,80})")
@@ -2949,6 +3122,17 @@ def _new_door_token(conn) -> str:
                    "Не удалось создать ссылку для персонала.")
 
 
+def _new_tv_token(conn) -> str:
+    for _ in range(5):
+        token = secrets.token_urlsafe(24)
+        exists = conn.execute(
+            "SELECT 1 FROM event_tv_links WHERE token = ?", (token,)
+        ).fetchone()
+        if not exists:
+            return token
+    raise APIError(500, "server_error", "Не удалось создать ссылку для TV.")
+
+
 # --------------------------------------------------------------------------
 # Админка: мероприятия
 # --------------------------------------------------------------------------
@@ -4283,6 +4467,192 @@ def api_admin_door_link_delete(req, event_id):
                    detail=f"{event['title']} · ссылка для персонала отозвана")
         conn.commit()
         return json_response({"ok": True, "deleted": bool(deleted)})
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/tv-link")
+def api_admin_tv_link_get(req, event_id):
+    session = _require_admin(req, csrf=False)
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Ссылку для TV создаёт организатор мероприятия.")
+        halls = conn.execute(
+            "SELECT id, name FROM halls WHERE event_id = ? "
+            "ORDER BY position, id", (event["id"],),
+        ).fetchall()
+        raw_hall = (parse_qs(req.query).get("hallId") or [""])[0]
+        hall_id = None
+        if raw_hall:
+            try:
+                hall_id = int(raw_hall)
+            except ValueError:
+                raise APIError(400, "validation", "Некорректный зал.") from None
+            if not any(item["id"] == hall_id for item in halls):
+                raise APIError(400, "validation", "Зал не найден.")
+        row = None
+        if hall_id:
+            row = conn.execute(
+                "SELECT * FROM event_tv_links WHERE event_id = ? AND hall_id = ?",
+                (event["id"], hall_id),
+            ).fetchone()
+        return json_response({
+            "link": _tv_link_payload(conn, event, row) if row else None,
+            "fonts": TV_FONTS,
+            "halls": [{"id": item["id"], "name": item["name"]}
+                      for item in halls],
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/admin/events/(\d{1,12})/tv-link", methods=("POST",))
+def api_admin_tv_link_save(req, event_id):
+    session = _require_admin(req)
+    data = req.json()
+    conn = db.connect()
+    try:
+        event, role = _event_guest_role(conn, session, int(event_id))
+        if role != "owner":
+            raise APIError(403, "forbidden",
+                           "Ссылку для TV создаёт организатор мероприятия.")
+        hall_id = data.get("hallId")
+        if isinstance(hall_id, bool) or not isinstance(hall_id, int):
+            raise APIError(400, "validation", "Выберите зал для TV.")
+        hall = conn.execute(
+            "SELECT id, name FROM halls WHERE id = ? AND event_id = ?",
+            (hall_id, event["id"]),
+        ).fetchone()
+        if not hall:
+            raise APIError(400, "validation", "Зал не найден.")
+        settings = _normalize_tv_settings(conn, event["id"],
+                                          data.get("settings"))
+        row = conn.execute(
+            "SELECT * FROM event_tv_links WHERE event_id = ? AND hall_id = ?",
+            (event["id"], hall_id),
+        ).fetchone()
+        now = timeutil.iso_now()
+        if row:
+            conn.execute(
+                "UPDATE event_tv_links SET settings = ?, updated_at = ? "
+                "WHERE event_id = ? AND hall_id = ?",
+                (json.dumps(settings, ensure_ascii=False), now,
+                 event["id"], hall_id),
+            )
+            _audit(conn, session, "tv.link.update", entity="event",
+                   entity_id=event["id"], event_id=event["id"],
+                   detail=f"{event['title']} · {hall['name']} · TV обновлён")
+        else:
+            token = _new_tv_token(conn)
+            conn.execute(
+                "INSERT INTO event_tv_links (event_id, hall_id, token, "
+                "settings, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (event["id"], hall_id, token,
+                 json.dumps(settings, ensure_ascii=False),
+                 session["user_id"], now, now),
+            )
+            _audit(conn, session, "tv.link.create", entity="event",
+                   entity_id=event["id"], event_id=event["id"],
+                   detail=f"{event['title']} · {hall['name']} · создана TV-ссылка")
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM event_tv_links WHERE event_id = ? AND hall_id = ?",
+            (event["id"], hall_id),
+        ).fetchone()
+        payload = _tv_link_payload(conn, event, row)
+        return json_response({
+            "link": payload,
+            "fonts": TV_FONTS,
+            "halls": payload["halls"],
+        })
+    finally:
+        conn.close()
+
+
+@route(r"/api/tv/([A-Za-z0-9_-]{16,80})")
+def api_tv_data(req, token):
+    conn = db.connect()
+    try:
+        link = _tv_link_row(conn, token)
+        if not link:
+            raise APIError(404, "not_found", "TV-ссылка не найдена.")
+        event = _event_row(conn, link["event_id"])
+        if not event:
+            raise APIError(404, "not_found", "Мероприятие не найдено.")
+        settings = _tv_settings(link)
+        settings["fontFamily"] = TV_FONT_MAP[settings["font"]]["family"]
+        now = timeutil.iso_now()
+        event_payload = {
+            "title": event["title"],
+            "city": event["city"],
+            "venue": event["venue"],
+            "startsAt": event["starts_at"],
+            "endsAt": event["ends_at"],
+            "timezone": event["timezone"],
+        }
+        hall = conn.execute(
+            "SELECT name FROM halls WHERE id = ? AND event_id = ?",
+            (link["hall_id"], event["id"]),
+        ).fetchone()
+        if not hall:
+            raise APIError(404, "not_found", "Зал для TV не найден.")
+        hall_name = hall["name"]
+        if not _is_publicly_visible(event, now) \
+                or not _lineup_is_visible(event, now):
+            return json_response({
+                "event": event_payload,
+                "settings": settings,
+                "hallName": hall_name,
+                "current": [],
+                "next": None,
+                "state": "ended" if now >= event["ends_at"] else "hidden",
+                "serverNow": now,
+            })
+        current_rows = conn.execute(
+            "SELECT p.*, h.name AS hall_name, h.position AS hall_position "
+            "FROM performances p JOIN halls h ON h.id = p.hall_id "
+            "WHERE h.event_id = ? AND h.id = ? "
+            "AND p.starts_at <= ? AND p.ends_at > ? "
+            "ORDER BY p.starts_at, p.id",
+            (event["id"], link["hall_id"], now, now),
+        ).fetchall()
+        next_row = conn.execute(
+            "SELECT p.*, h.name AS hall_name "
+            "FROM performances p JOIN halls h ON h.id = p.hall_id "
+            "WHERE h.event_id = ? AND h.id = ? AND p.starts_at > ? "
+            "ORDER BY p.starts_at, p.id LIMIT 1",
+            (event["id"], link["hall_id"], now),
+        ).fetchone()
+        if now < event["starts_at"]:
+            state = "before"
+        elif now >= event["ends_at"]:
+            state = "ended"
+        elif current_rows:
+            state = "live"
+        else:
+            state = "break"
+
+        def performance_json(row):
+            return {
+                "name": _perf_display_name(row),
+                "hallName": row["hall_name"],
+                "startsAt": row["starts_at"],
+                "endsAt": row["ends_at"],
+            }
+
+        return json_response({
+            "event": event_payload,
+            "settings": settings,
+            "hallName": hall_name,
+            "current": [performance_json(row) for row in current_rows],
+            "next": performance_json(next_row) if next_row else None,
+            "state": state,
+            "serverNow": now,
+        })
     finally:
         conn.close()
 

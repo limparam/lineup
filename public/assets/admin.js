@@ -61,6 +61,11 @@ let availablePromoters = [];
 let registrationLinks = [];
 let registrationTimer = null;
 let doorLink = null;
+let tvEventId = null;
+let tvHallId = null;
+let tvLink = null;
+let tvFonts = [];
+let tvHalls = [];
 
 /* --------------------------------------------------------------- utils */
 
@@ -325,18 +330,12 @@ function renderEventList(events) {
       actions.push(el("button", {
         class: "btn btn--sm",
         type: "button",
-        text: "Открыть",
-        onClick: () => openEvent(event.id).catch((error) => toast(error.message, "error")),
+        text: "Ссылка",
+        title: canShareEvent(event)
+          ? "Скопировать ссылку на мероприятие"
+          : "Скопировать прямую ссылку — откроется после публикации",
+        onClick: () => copyEventLink(event).catch((error) => toast(error.message, "error")),
       }));
-      if (canShareEvent(event)) {
-        actions.push(el("button", {
-          class: "btn btn--sm",
-          type: "button",
-          text: "Ссылка",
-          title: "Скопировать ссылку на мероприятие",
-          onClick: () => copyEventLink(event).catch((error) => toast(error.message, "error")),
-        }));
-      }
       if (canDownloadEventQr(event)) {
         actions.push(el("button", {
           class: "btn btn--sm",
@@ -346,6 +345,19 @@ function renderEventList(events) {
           onClick: () => downloadEventQr(event).catch((error) => toast(error.message, "error")),
         }));
       }
+      actions.push(el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "Открыть",
+        onClick: () => openEvent(event.id).catch((error) => toast(error.message, "error")),
+      }));
+      actions.push(el("button", {
+        class: "btn btn--sm",
+        type: "button",
+        text: "TV",
+        title: "Экран для телевизора",
+        onClick: () => openTvDialog(event).catch((error) => toast(error.message, "error")),
+      }));
       actions.push(el("button", {
         class: "btn btn--sm btn--danger",
         type: "button",
@@ -428,7 +440,10 @@ function copyToClipboard(text) {
 
 async function copyEventLink(event) {
   await copyToClipboard(eventPublicUrl(event));
-  toast("Ссылка на мероприятие скопирована");
+  toast(canShareEvent(event)
+    ? "Ссылка на мероприятие скопирована"
+    : "Ссылка скопирована. Страница станет доступна после публикации "
+      + "или переноса на будущую дату.");
 }
 
 async function downloadEventQr(event) {
@@ -1531,6 +1546,144 @@ async function revokeDoorLink() {
   }
 }
 
+function tvLinkUrl() {
+  return tvLink
+    ? new URL(tvLink.path, window.location.origin).href
+    : "";
+}
+
+function toggleTvOptionRows() {
+  $("tv-bg-gradient-row").hidden = $("tv-bg-mode").value !== "gradient";
+  $("tv-name-gradient-row").hidden = !$("tv-name-gradient").checked;
+}
+
+function renderTvHallSelect() {
+  const select = $("tv-hall-select");
+  clear(select);
+  for (const hall of tvHalls) {
+    select.append(el("option", {
+      value: String(hall.id),
+      text: hall.name,
+    }));
+  }
+  if (tvHallId) select.value = String(tvHallId);
+}
+
+function renderTvDialog() {
+  if (!tvLink) return;
+  const settings = tvLink.settings;
+  renderTvHallSelect();
+  $("tv-url").value = tvLinkUrl();
+  $("tv-open").href = tvLinkUrl();
+  clear($("tv-font"));
+  for (const font of tvFonts) {
+    $("tv-font").append(el("option", {
+      value: font.id,
+      text: font.label,
+    }));
+  }
+  $("tv-font").value = settings.font;
+  $("tv-font-size").value = settings.fontSize;
+  $("tv-bg-mode").value = settings.backgroundMode;
+  $("tv-bg").value = settings.background;
+  $("tv-bg-from").value = settings.backgroundFrom;
+  $("tv-bg-to").value = settings.backgroundTo;
+  $("tv-name-color").value = settings.nameColor;
+  $("tv-name-gradient").checked = Boolean(settings.nameGradient);
+  $("tv-name-from").value = settings.nameFrom;
+  $("tv-name-to").value = settings.nameTo;
+  $("tv-effect").value = settings.effect;
+  $("tv-speed").value = settings.speed;
+  $("tv-show-next").checked = Boolean(settings.showNext);
+  toggleTvOptionRows();
+  $("tv-error").hidden = true;
+}
+
+async function loadTvHall(hallId) {
+  if (!tvEventId) return;
+  let data = await request(
+    `/api/admin/events/${tvEventId}/tv-link?hallId=${encodeURIComponent(hallId)}`);
+  if (!data.link) {
+    data = await request(`/api/admin/events/${tvEventId}/tv-link`, {
+      method: "POST",
+      body: { hallId, settings: {} },
+    });
+  }
+  tvFonts = data.fonts || tvFonts;
+  tvHalls = data.halls || tvHalls;
+  tvLink = data.link;
+  tvHallId = hallId;
+  renderTvDialog();
+}
+
+async function openTvDialog(eventOrId) {
+  const eventId = typeof eventOrId === "object" && eventOrId
+    ? eventOrId.id
+    : eventOrId;
+  if (!eventId) return;
+  tvEventId = eventId;
+  $("tv-error").hidden = true;
+  try {
+    const data = await request(`/api/admin/events/${eventId}/tv-link`);
+    tvFonts = data.fonts || [];
+    tvHalls = data.halls || [];
+    if (!tvHalls.length) {
+      toast("Сначала добавьте зал для TV", "error");
+      return;
+    }
+    const preferred = tvHalls.some((hall) => hall.id === tvHallId)
+      ? tvHallId
+      : tvHalls[0].id;
+    await loadTvHall(preferred);
+    $("tv-dialog").showModal();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function tvSettingsFromForm() {
+  return {
+    backgroundMode: $("tv-bg-mode").value,
+    background: $("tv-bg").value,
+    backgroundFrom: $("tv-bg-from").value,
+    backgroundTo: $("tv-bg-to").value,
+    font: $("tv-font").value,
+    fontSize: $("tv-font-size").value,
+    nameColor: $("tv-name-color").value,
+    nameGradient: $("tv-name-gradient").checked,
+    nameFrom: $("tv-name-from").value,
+    nameTo: $("tv-name-to").value,
+    effect: $("tv-effect").value,
+    speed: $("tv-speed").value,
+    showNext: $("tv-show-next").checked,
+  };
+}
+
+async function saveTvSettings(event) {
+  event.preventDefault();
+  if (!tvEventId) return;
+  const button = $("tv-form").querySelector('button[type="submit"]');
+  setBusy(button, true);
+  $("tv-error").hidden = true;
+  try {
+    const data = await request(`/api/admin/events/${tvEventId}/tv-link`, {
+      method: "POST",
+      body: { hallId: tvHallId, settings: tvSettingsFromForm() },
+    });
+    tvFonts = data.fonts || tvFonts;
+    tvHalls = data.halls || tvHalls;
+    tvLink = data.link;
+    renderTvDialog();
+    toast("Настройки TV сохранены");
+  } catch (error) {
+    const box = $("tv-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 async function shareDoorLink() {
   const url = doorLinkUrl();
   if (!url) return;
@@ -1677,7 +1830,9 @@ function fillEventForm() {
   if (isSuper && current.ownerUsername) {
     subParts.push(`автор: ${current.ownerUsername}`);
   }
-  if (current.published && current.publiclyVisible === false) {
+  if (!current.published) {
+    subParts.push("черновик");
+  } else if (current.publiclyVisible === false) {
     subParts.push("скрыто с сайта");
   }
   $("event-sub").textContent = subParts.filter(Boolean).join(" · ");
@@ -1688,7 +1843,11 @@ function fillEventForm() {
   const publicLink = $("open-public");
   publicLink.hidden = !current.published || current.publiclyVisible === false;
   publicLink.href = `/e/${encodeURIComponent(current.slug)}`;
-  $("copy-event-link").hidden = !canShareEvent(current);
+  const copyLink = $("copy-event-link");
+  copyLink.hidden = false;
+  copyLink.title = canShareEvent(current)
+    ? "Скопировать ссылку на мероприятие"
+    : "Скопировать прямую ссылку — откроется после публикации";
   $("download-qr").hidden = !canDownloadEventQr(current);
 }
 
@@ -3287,6 +3446,28 @@ $("door-link-revoke").addEventListener("click", () => {
   revokeDoorLink().catch((error) => toast(error.message, "error"));
 });
 $("door-link-close").addEventListener("click", () => $("door-link-dialog").close());
+$("tv-link-btn").addEventListener("click", () => {
+  if (!current) return;
+  openTvDialog(current).catch((error) => toast(error.message, "error"));
+});
+$("tv-close").addEventListener("click", () => $("tv-dialog").close());
+$("tv-form").addEventListener("submit", saveTvSettings);
+$("tv-copy").addEventListener("click", () => {
+  copyToClipboard(tvLinkUrl())
+    .then(() => toast("Ссылка для TV скопирована"))
+    .catch((error) => toast(error.message, "error"));
+});
+$("tv-bg-mode").addEventListener("change", toggleTvOptionRows);
+$("tv-name-gradient").addEventListener("change", toggleTvOptionRows);
+$("tv-hall-select").addEventListener("change", () => {
+  const hallId = Number($("tv-hall-select").value);
+  if (!hallId) return;
+  loadTvHall(hallId).catch((error) => {
+    const box = $("tv-error");
+    box.textContent = error.message;
+    box.hidden = false;
+  });
+});
 $("guest-promoter-add").addEventListener("click", () => {
   addPromoter().catch((error) => toast(error.message, "error"));
 });

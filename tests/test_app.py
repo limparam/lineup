@@ -1830,6 +1830,149 @@ class LineUPTestCase(unittest.TestCase):
             {"csv": csv_text}, csrf=promo.csrf)
         self.assertEqual(status, 403)
 
+    def test_tv_link_settings_and_current_performer(self):
+        now = timeutil.now_utc()
+        starts = timeutil.to_local_input(
+            now - timedelta(hours=2), "Europe/Moscow")
+        ends = timeutil.to_local_input(
+            now + timedelta(hours=8), "Europe/Moscow")
+        event = self.create_event(
+            title="TV NIGHT", startsAt=starts, endsAt=ends)
+        hall = self.add_hall(event["id"], "Main Stage")
+        loft = self.add_hall(event["id"], "Loft")
+        self.add_perf(
+            hall["id"], "DJ TEST",
+            timeutil.to_local_input(now - timedelta(minutes=30),
+                                    "Europe/Moscow"),
+            timeutil.to_local_input(now + timedelta(minutes=90),
+                                    "Europe/Moscow"),
+        )
+        self.add_perf(
+            hall["id"], "NEXT DJ",
+            timeutil.to_local_input(now + timedelta(minutes=90),
+                                    "Europe/Moscow"),
+            timeutil.to_local_input(now + timedelta(minutes=210),
+                                    "Europe/Moscow"),
+        )
+        self.add_perf(
+            loft["id"], "LOFT DJ",
+            timeutil.to_local_input(now - timedelta(minutes=20),
+                                    "Europe/Moscow"),
+            timeutil.to_local_input(now + timedelta(minutes=100),
+                                    "Europe/Moscow"),
+        )
+
+        status, _, data = self.client.get(
+            f"/api/admin/events/{event['id']}/tv-link")
+        self.assertEqual(status, 200, data)
+        self.assertIsNone(data["link"])
+        self.assertEqual(len(data["fonts"]), 15)
+        self.assertEqual([item["name"] for item in data["halls"]],
+                         ["Main Stage", "Loft"])
+
+        settings = {
+            "backgroundMode": "solid",
+            "background": "#100820",
+            "font": "impact",
+            "fontSize": "fill",
+            "speed": "fast",
+            "nameGradient": True,
+            "nameFrom": "#ffcc00",
+            "nameTo": "#ff3d81",
+            "effect": "marquee2",
+            "showNext": False,
+        }
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/tv-link",
+            {"hallId": hall["id"], "settings": settings},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, data)
+        path = data["link"]["path"]
+        token = path.rsplit("/", 1)[-1]
+        saved = data["link"]["settings"]
+        self.assertEqual(saved["effect"], "marquee2")
+        self.assertEqual(saved["font"], "impact")
+        self.assertEqual(saved["fontSize"], "fill")
+        self.assertEqual(saved["speed"], "fast")
+        self.assertFalse(saved["showNext"])
+        self.assertTrue(saved["nameGradient"])
+        self.assertEqual(data["link"]["hall"]["name"], "Main Stage")
+        self.assertEqual(data["halls"][0]["name"], "Main Stage")
+
+        # У второго зала — своя ссылка и своё оформление.
+        status, _, loft_data = self.client.post(
+            f"/api/admin/events/{event['id']}/tv-link",
+            {"hallId": loft["id"],
+             "settings": {"effect": "static", "fontSize": "large",
+                          "speed": "slow"}},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 200, loft_data)
+        self.assertNotEqual(loft_data["link"]["path"], path)
+        loft_token = loft_data["link"]["path"].rsplit("/", 1)[-1]
+        status, _, loft_tv = self.client.get(f"/api/tv/{loft_token}")
+        self.assertEqual(status, 200, loft_tv)
+        self.assertEqual(loft_tv["hallName"], "Loft")
+        self.assertEqual(loft_tv["current"][0]["name"], "LOFT DJ")
+        self.assertEqual(loft_tv["settings"]["effect"], "static")
+
+        status, headers, _ = self.client.get(path)
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["content-type"])
+
+        status, _, data = self.client.get(f"/api/tv/{token}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["state"], "live")
+        self.assertEqual(data["current"][0]["name"], "DJ TEST")
+        self.assertEqual(data["next"]["name"], "NEXT DJ")
+        self.assertEqual(data["hallName"], "Main Stage")
+        self.assertEqual(data["settings"]["effect"], "marquee2")
+        self.assertEqual(data["settings"]["font"], "impact")
+        self.assertIn("Impact", data["settings"]["fontFamily"])
+
+        status, _, _ = self.client.patch(
+            f"/api/admin/events/{event['id']}",
+            {"lineupVisible": False}, csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        status, _, data = self.client.get(f"/api/tv/{token}")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["state"], "hidden")
+        self.assertEqual(data["current"], [])
+
+        status, _, _ = self.client.patch(
+            f"/api/admin/events/{event['id']}",
+            {"lineupVisible": True}, csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        status, _, data = self.client.get(f"/api/tv/{token}")
+        self.assertEqual(data["state"], "live")
+
+        status, _, _ = self.client.patch(
+            f"/api/admin/events/{event['id']}",
+            {"published": False}, csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        status, _, data = self.client.get(f"/api/tv/{token}")
+        self.assertEqual(data["state"], "hidden")
+
+        status, _, _ = self.client.patch(
+            f"/api/admin/events/{event['id']}",
+            {"published": True}, csrf=self.client.csrf)
+        self.assertEqual(status, 200)
+        status, _, data = self.client.get(f"/api/tv/{token}")
+        self.assertEqual(data["state"], "live")
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/tv-link",
+            {"hallId": hall["id"], "settings": {"background": "red"}},
+            csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+        status, _, data = self.client.post(
+            f"/api/admin/events/{event['id']}/tv-link",
+            {"settings": {}}, csrf=self.client.csrf)
+        self.assertEqual(status, 400, data)
+
+        status, _, _ = self.client.get("/api/tv/AAAAAAAAAAAAAAAAAAAA")
+        self.assertEqual(status, 404)
+
     def test_guest_list_validation_and_public_visibility(self):
         event = self.create_event(title="GUEST VALIDATION")
         status, _, data = self.client.post(
